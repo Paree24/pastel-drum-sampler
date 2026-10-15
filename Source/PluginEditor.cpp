@@ -218,10 +218,11 @@ SamplerEditor::FxChainView::FxChainView (SamplerEditor& e, bool g) : ed (e), isG
         for (int i = 0; i < FxChainState::NumSlots; ++i)
             if (ch.slots[(size_t) i].type.load() == FX_NONE) { free = i; break; }
         if (free < 0) return; // chain full
+        auto* view = this; // (MSVC resolves `this` in a nested capture to the outer lambda)
         juce::PopupMenu menu;
         for (int t = 0; t < 8; ++t) if (isUsableFx (t)) menu.addItem (t + 1, fxTypeName (t));
         menu.showMenuAsync (juce::PopupMenu::Options().withTargetScreenArea (addB.getScreenBounds()),
-            [sp = juce::Component::SafePointer<FxChainView> (this), free] (int id) {
+            [sp = juce::Component::SafePointer<FxChainView> (view), free] (int id) {
                 if (id <= 0 || sp == nullptr) return;
                 FxProcessor::defaultSlot (id - 1, sp->chain().slots[(size_t) free]);
                 sp->ed.proc.maintenance();
@@ -817,9 +818,10 @@ BrowserPanel::BrowserPanel (SamplerEditor& e) : ed (e) {
     addAndMakeVisible (dirBox);
     addDirB.setTooltip ("Add a folder shortcut");
     addDirB.onClick = [this] {
+        auto* panel = this; // (MSVC resolves `this` in a nested capture to the outer lambda)
         auto fc = std::make_shared<juce::FileChooser> ("Add folder shortcut", juce::File (lib.getCurrentDir()));
         fc->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
-            [sp = juce::Component::SafePointer<BrowserPanel> (this), fc] (const juce::FileChooser&) {
+            [sp = juce::Component::SafePointer<BrowserPanel> (panel), fc] (const juce::FileChooser&) {
                 auto d = fc->getResult();
                 if (sp == nullptr || ! d.isDirectory()) return;
                 sp->lib.addShortcut (d.getFullPathName());
