@@ -1,0 +1,28 @@
+# Build output (JUCE is fetched fresh by CMake, artefacts regenerate)
+build/
+cmake-build-*/
+out/
+
+# Compiled objects / libs (always under build/, belt and braces)
+*.o
+*.a
+*.so
+*.dll
+*.dylib
+
+# Editors / OS noise
+.vscode/
+.idea/
+*~
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local test / packaging scratch (regenerable)
+*.zip
+*.tar.gz
+
+# kit generator: local venv + build intermediates
+tools/.venv/
+__pycache__/
+tools/kitgen/kits.json
