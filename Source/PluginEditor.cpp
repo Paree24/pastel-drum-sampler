@@ -1442,7 +1442,7 @@ void SamplerEditor::rebuildPage() {
             auto* timeK = row2.back().get();
             row2.push_back (makeAtomicKnob ("DLY FDBK", proc.dlyFb, pct, -1));
             // DLY SYNC: FREE, then the shared tempo divisions (host tempo, 120 BPM without one)
-            constexpr int steps = TempoSync::NumDivisions;
+            static constexpr int steps = TempoSync::NumDivisions;   // static: usable in the lambdas below without a capture (MSVC)
             auto sk = std::make_unique<Knob> ("DLY SYNC", col);
             sk->val.setColour (juce::Label::textColourId, col.brighter (0.2f));
             sk->setManual ((float) (proc.dlySync.load() + 1) / steps, [pr, timeK] (float v) {
