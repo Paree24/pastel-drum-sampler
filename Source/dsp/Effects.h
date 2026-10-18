@@ -69,8 +69,33 @@ struct FxSlot {
 
 struct FxChainState {
     static constexpr int NumSlots = 10;
+    // slot order, 4 bits per position in one atomic word: the UI swaps and the
+    // audio thread reads the whole permutation at once (never a half-done swap)
+    struct ChainOrder {
+        using Array = std::array<int, NumSlots>;
+        static constexpr juce::uint64 pack (const Array& a) {
+            juce::uint64 b = 0;
+            for (int k = 0; k < NumSlots; ++k) b |= (juce::uint64) (a[(size_t) k] & 0xF) << (4 * k);
+            return b;
+        }
+        static constexpr Array identity() { Array a {}; for (int k = 0; k < NumSlots; ++k) a[(size_t) k] = k; return a; }
+        std::atomic<juce::uint64> bits { pack (identity()) };
+
+        ChainOrder() = default;
+        ChainOrder (const ChainOrder& o) : bits (o.bits.load()) {}
+        ChainOrder& operator= (const ChainOrder& o) { bits.store (o.bits.load()); return *this; }
+        Array load() const {
+            const auto b = bits.load (std::memory_order_acquire);
+            Array a {};
+            for (int k = 0; k < NumSlots; ++k) a[(size_t) k] = (int) ((b >> (4 * k)) & 0xF);
+            return a;
+        }
+        void store (const Array& a) { bits.store (pack (a), std::memory_order_release); }
+        void reset() { store (identity()); }
+        int operator[] (size_t k) const { return (int) ((bits.load (std::memory_order_acquire) >> (4 * k)) & 0xF); }
+    };
     FxSlot slots[NumSlots];
-    std::array<int, NumSlots> order { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    ChainOrder order;
     std::atomic<bool> enabled { true }; // master toggle for the whole chain
 
     FxChainState() = default;
@@ -102,10 +127,11 @@ struct FxChainState {
             slots[i].p3.store (0.5f); slots[i].p4.store (0.5f); slots[i].p5.store (1.f);
         }
         for (int i = 0; i < NumSlots && i < v.getNumChildren(); ++i) slots[i].fromVT (v.getChild (i));
-        for (int i = 0; i < NumSlots; ++i) order[(size_t) i] = i; // reset before applying stored order
+        auto ord = ChainOrder::identity(); // reset before applying stored order
         auto o = v.getProperty ("order", "0,1,2,3,4,5,6,7,8,9").toString();
         auto toks = juce::StringArray::fromTokens (o, ",", "");
-        for (int i = 0; i < NumSlots && i < toks.size(); ++i) order[(size_t) i] = juce::jlimit (0, NumSlots - 1, toks[i].getIntValue());
+        for (int i = 0; i < NumSlots && i < toks.size(); ++i) ord[(size_t) i] = juce::jlimit (0, NumSlots - 1, toks[i].getIntValue());
+        order.store (ord);
         enabled.store ((bool) v.getProperty ("enabled", true));
     }
 };
@@ -284,8 +310,11 @@ struct FxProcessor {
     // shared send returns (wet only): REV DECAY/DAMP 0..1, DLY TIME/FDBK 0..1
     static void sendReverbStereo (SlotDsp& dsp, float x, float decay, float damp, float& outL, float& outR);
     static float rt60FromKnob (float v01) { return 0.15f * std::pow (133.f, juce::jlimit (0.f, 1.f, v01)); } // 0.15 .. 20 s
-    // stereo ping-pong send delay: in -> L, repeats alternate L/R
-    static void sendDelayStereo (SlotDsp& dsp, float x, float time, float fb, float sr, float& outL, float& outR);
+    // stereo ping-pong send delay: in -> L, repeats alternate L/R. timeSec is
+    // clamped to the delay buffer (sendDelayMaxSec once the send slot is sized)
+    static void sendDelayStereo (SlotDsp& dsp, float x, float timeSec, float fb, float sr, float& outL, float& outR);
+    static float sendDelaySeconds (float v01) { return 0.02f + v01 * v01 * 1.2f; } // free-running DLY TIME knob
+    static constexpr double sendDelayMaxSec = 2.1;   // a 1/2 note down to ~57 BPM
     static void defaultSlot (int type, FxSlot& s);
     static void clearChain (FxChainState& ch); // empty: all slots OFF
     static int numActive (const FxChainState& ch);

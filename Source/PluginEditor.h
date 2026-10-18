@@ -2,6 +2,7 @@
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 #include "FileLibrary.h"
+#include "Visuals.h"
 
 namespace mds {
 
@@ -187,11 +188,13 @@ public:
 
     SamplerProcessor& proc;
     PastelLNF lnf;
+    juce::TooltipWindow tooltips { this, 700 };   // child of the editor: setTooltip() texts show up in every host
     int sel() const { return proc.selectedPad.load(); }
     int selLayer() const { return proc.selectedLayer.load(); }
     void selectPad (int p);
     void selectLayer (int l);
-    void refreshAll();            // after any structural change
+    void refreshAll();
+    void applyPadAccent (int pad);            // after any structural change
     void showParamMenu (int pad, int param, Knob* k);
     void chooseFilesForLayer (int pad, int layer);
     void stepLayerFile (int dir); // < > : neighbouring file in the same folder
@@ -217,6 +220,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> masterDialAtt, masterFaderAtt;
     juce::TextButton limitB { "LIMITER" };
     juce::Label outTitle { {}, "OUTPUT" };
+    MeterComp outMeter { [this] { return proc.outLevel.load(); }, false };
     juce::Rectangle<int> footerRect, padArea;
 
     // pads
@@ -239,11 +243,15 @@ private:
     juce::Label fmodeLab { {}, "MODE" };
     juce::ComboBox fmodeBox;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> fmodeAtt;
-    juce::TextButton stackB { "STACK" }, rrB { "ROUND ROBIN" };
+    juce::TextButton stackB { "STACK" }, rrB { "ROUND ROBIN" }, velB { "VELOCITY" };
     juce::Label layersLab { {}, "LAYERS" };
     std::vector<std::unique_ptr<LayerCell>> layerCells;
     WaveView wave { *this };
     juce::TextButton prevFileB { "<" }, nextFileB { ">" }, loadB { "LOAD..." }, revB { "REVERSE" }, normB { "NORMALIZE" }, clearB { "CLEAR" };
+    juce::TextButton scopeB { "SCOPE" };   // waveform <-> scope + spectrum of the selected pad's output
+    ScopeSource selectedScope() const;
+    ScopeView padScope { [this] { return selectedScope(); } };
+    SpectrumView padSpectrum { [this] { return selectedScope(); } };
     std::vector<std::unique_ptr<Knob>> row1, row2;
     juce::Label row1Lab, row2Lab;
     std::unique_ptr<MacroPanel> macroPanel;

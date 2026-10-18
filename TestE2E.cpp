@@ -125,8 +125,8 @@ int main() {
         auto pp = makeProc(); auto& p = *pp;
         p.loadLayer (0, 0, loud);
         auto b = render (p, 4000, hit (36, 1000));
-        int on = firstAbove (b, 0, 1.0e-5f);
-        CHECK (on >= 1000 && on < 1010, "note at sample 1000 starts at %d", on);
+        int on = firstAbove (b, 0, 1.0e-5f) - p.getLatencySamples();   // the limiter's lookahead (reported to the host)
+        CHECK (p.getLatencySamples() > 0 && on >= 1000 && on < 1010, "note at sample 1000 starts at %d (+%d latency)", on, p.getLatencySamples());
     }
     // ---- 3. multi-out routing ----
     {
@@ -423,6 +423,96 @@ int main() {
         p.loadPadFiles (2, drop);
         CHECK (p.numLoadedLayers (2) == 4, "dropping 5 files fills 4 layers");
     }
+    // ---- 12b. limiter, voice steal, velocity layers, tempo sync, knob undo, async kits ----
+    {
+        auto pp = makeProc(); auto& p = *pp;
+        auto hot = sineFile ("hot.wav", 0.99f, 0.3);
+        for (int l = 0; l < NumLayers; ++l) p.loadLayer (0, l, hot);
+        p.setPadParam (0, PP_Level, 6.f);
+        p.limiterOn = true;
+        auto b = render (p, 12000, hit (36));
+        CHECK (peak (b, 0) <= 0.9662f && peak (b, 0) > 0.9f && allFinite (b), "lookahead limiter holds -0.3 dBFS (peak %.4f)", peak (b, 0));
+        // aux buses get the same lookahead delay as Main
+        p.limiterOn = false; p.setPadParam (0, PP_Level, 0.f);
+        p.pads[1].output = 0; p.loadLayer (1, 0, hot);
+        p.pads[2].output = 3; p.loadLayer (2, 0, hot);
+        render (p, 48000);
+        Events two { { 500, juce::MidiMessage::noteOn (1, 37, 1.f) }, { 500, juce::MidiMessage::noteOn (1, 38, 1.f) } };
+        auto c = render (p, 4000, two);
+        CHECK (firstAbove (c, 0, 1.0e-4f) == firstAbove (c, busCh (p, 3), 1.0e-4f), "aux bus stays sample-aligned with Main (%d vs %d)",
+               firstAbove (c, 0, 1.0e-4f), firstAbove (c, busCh (p, 3), 1.0e-4f));
+    }
+    {
+        auto pp = makeProc(); auto& p = *pp;
+        auto longHot = sineFile ("steal.wav", 0.3f, 2.0, 100.f);
+        p.loadLayer (0, 0, longHot);
+        Events many;
+        for (int k = 0; k < MaxVoices + 8; ++k) many.push_back ({ k * 64, juce::MidiMessage::noteOn (1, 36, 1.f) });
+        auto b = render (p, (MaxVoices + 8) * 64 + 2000, many);
+        float maxStep = 0.f;
+        for (int i = 1; i < b.getNumSamples(); ++i) maxStep = juce::jmax (maxStep, std::abs (b.getSample (0, i) - b.getSample (0, i - 1)));
+        CHECK (p.activeVoices.load() <= MaxVoices && allFinite (b), "voice pool capped at %d (%d)", MaxVoices, p.activeVoices.load());
+        CHECK (maxStep < 1.5f, "stolen voices fade, no hard cut (max step %.3f)", maxStep);
+    }
+    {
+        auto pp = makeProc(); auto& p = *pp;
+        p.loadLayer (0, 0, quiet); p.loadLayer (0, 1, loud);
+        p.setPadParam (0, PP_VelAmp, 0.f);
+        p.setLayerMode (0, LM_Velocity);
+        CHECK (p.pads[0].layers[0].hiVel == 63 && p.pads[0].layers[1].loVel == 64, "VELOCITY mode splits full-range layers (0-%d / %d-127)",
+               p.pads[0].layers[0].hiVel.load(), p.pads[0].layers[1].loVel.load());
+        auto soft = render (p, 6000, hit (36, 0, 40.f / 127.f));
+        render (p, 48000);
+        auto hard = render (p, 6000, hit (36, 0, 1.f));
+        CHECK (std::abs (peak (soft, 0) - 0.2f) < 0.03f && std::abs (peak (hard, 0) - 0.6f) < 0.05f, "velocity picks the layer (soft %.3f, hard %.3f)", peak (soft, 0), peak (hard, 0));
+        auto st = p.padToVT (0);
+        auto qq = makeProc(); qq->padFromVT (0, st);
+        CHECK (qq->pads[0].layerMode == LM_Velocity && qq->pads[0].layers[1].loVel == 64, "velocity ranges saved with the kit");
+    }
+    {
+        auto pp = makeProc(); auto& p = *pp;
+        CHECK (std::abs (TempoSync::divisionSeconds (1, 120.0) - 0.25) < 1e-9 && std::abs (TempoSync::divisionSeconds (2, 100.0) - 0.45) < 1e-9, "tempo divisions (1/8 @120 = 250 ms)");
+        p.loadLayer (0, 0, writeWav ("click.wav", 48000.0, 1, 64, [] (int, int i) { return i < 8 ? 0.9f : 0.f; }));
+        p.setPadParam (0, PP_SendDly, 100.f);
+        p.dlySync = 1; p.dlyFb = 0.f;   // 1/8 at the 120 BPM fallback (no playhead) = 12000 samples
+        auto b = render (p, 20000, hit (36));
+        int echo = -1;
+        for (int i = 6000; i < b.getNumSamples(); ++i) if (std::abs (b.getSample (0, i)) > 0.05f) { echo = i - p.getLatencySamples(); break; }
+        CHECK (std::abs (echo - 12000) < 40, "synced delay return lands on the 1/8 (%d)", echo);
+        auto st = p.fullStateVT();
+        CHECK ((int) st.getProperty ("dlySync") == 1, "delay sync saved");
+    }
+    {
+        auto pp = makeProc(); auto& p = *pp;
+        p.undoStack.clear();
+        juce::AudioProcessorParameter* prm = p.padParam (3, PP_Cutoff);
+        float before = prm->getValue();
+        prm->beginChangeGesture(); prm->setValueNotifyingHost (0.2f); prm->setValueNotifyingHost (0.3f); prm->endChangeGesture();
+        CHECK (p.undoStack.size() == 1, "one knob gesture = one undo step (%d)", (int) p.undoStack.size());
+        p.undo();
+        CHECK (std::abs (prm->getValue() - before) < 1e-5f && p.undoStack.empty(), "UNDO puts the knob back");
+        p.redo();
+        CHECK (std::abs (prm->getValue() - 0.3f) < 1e-5f, "REDO turns it again");
+        prm->beginChangeGesture(); prm->endChangeGesture();
+        CHECK (p.undoStack.size() == 1, "a click without a change records nothing");
+        // a failed user-kit load keeps the history
+        p.redoStack.push_back (p.fullStateVT());
+        auto bad = tmpRoot.getChildFile ("bad.xml"); bad.replaceWithText ("<nope/>");
+        CHECK (! loadUserPreset (bad, p) && p.redoStack.size() == 1 && p.undoStack.size() == 1, "a failed kit load leaves undo / redo alone");
+        // FX order: packed, atomic, survives save/load
+        auto& ch = p.pads[0].fx;
+        ch.order.store ({ 3, 1, 2, 0, 4, 5, 6, 7, 8, 9 });
+        FxChainState back; back.fromVT (ch.toVT());
+        CHECK (back.order[0] == 3 && back.order[3] == 0 && back.order[9] == 9, "chain order round-trips");
+        // background kit load
+        p.loadLayer (5, 0, loud);
+        auto kitFile = tmpRoot.getChildFile ("Async Kit.xml");
+        savePresetFile (p, kitFile);
+        p.initKitNoUndo();
+        CHECK (p.loadUserKitAsync (kitFile) && p.isLoadingKit(), "kit load starts in the background");
+        for (int t = 0; t < 250 && p.isLoadingKit(); ++t) flush();
+        CHECK (! p.isLoadingKit() && p.pads[5].layers[0].hasSample() && p.kitName == "Async Kit", "background kit load lands on the message thread");
+    }
     // ---- 13. UI audition + editor smoke ----
     {
         auto pp = makeProc(); auto& p = *pp;
@@ -435,6 +525,7 @@ int main() {
         if (se != nullptr) {
             for (int pg = 0; pg < 5; ++pg) { se->setPageForTest (pg); flush(); }
             for (int v = 0; v < 3; ++v) { se->setViewForTest (v); flush(); }
+            p.setLayerMode (4, LM_Velocity); se->setPageForTest (0); flush(); se->setPageForTest (4);
             for (int pad = 0; pad < NumPads; ++pad) se->selectPad (pad);
             se->selectPad (4); se->selectLayer (2);
             se->timerCallback();

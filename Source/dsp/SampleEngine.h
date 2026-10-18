@@ -18,6 +18,7 @@ constexpr int NumAuxOuts = 16;      // stereo aux buses after Main ("Out 2".."Ou
 constexpr int NumChokeGroups = 8;
 constexpr int BasePadNote = 36;     // pad 1 = C1 (GM drum layout), chromatic upwards
 constexpr int MaxVoices = 64;
+constexpr int StealVoices = 8;      // spare slots: a stolen voice fades out in one while the new hit starts
 
 inline int padMidiNote (int pad) { return BasePadNote + pad; }
 inline juce::String noteName (int m) {
@@ -79,7 +80,7 @@ const LayerParamMeta& layerParamMeta (int idx);
 juce::String formatLayerParam (int idx, float v, double lengthSec);
 
 enum VoiceMode { VM_Poly = 0, VM_Mono, VM_Gated };
-enum LayerMode { LM_Stack = 0, LM_RoundRobin };
+enum LayerMode { LM_Stack = 0, LM_RoundRobin, LM_Velocity };   // VELOCITY: layers whose LO..HI VEL range holds the hit play (SFZ lovel/hivel)
 
 // ---- decoded sample (shared, immutable after load) ----
 // Lifetime: the processor's pool keeps one reference to every sample, voices
@@ -109,8 +110,10 @@ struct Layer {
     bool missing = false;            // message thread: path set but file could not be loaded
     std::atomic<float> v[NumLayerParams];
     std::atomic<bool> reverse { false }, normalize { false };
+    std::atomic<int> loVel { 0 }, hiVel { 127 };   // MIDI velocity range (VELOCITY layer mode), inclusive
 
     Layer() { resetParams(); }
+    bool velocityMatches (int v127) const { return v127 >= loVel.load() && v127 <= hiVel.load(); }
     SampleData::Ptr get() const { const juce::SpinLock::ScopedLockType l (lock); return data; }
     void set (SampleData::Ptr p) {
         SampleData::Ptr old;
@@ -121,6 +124,7 @@ struct Layer {
     void resetParams() {
         for (int i = 0; i < NumLayerParams; ++i) v[i].store (layerParamMeta (i).def);
         reverse = false; normalize = false;
+        loVel = 0; hiVel = 127;
     }
 };
 
@@ -152,6 +156,7 @@ struct SampleVoice {
     void start (const VoiceStart& s, juce::uint32 stamp);
     void noteOff();                       // gated pads: enter RELEASE
     void choke (float ms);                // fast fade (choke groups, mono retrigger, steal)
+    bool fading() const { return active && chokeStep > 0.f; }
     // adds one stereo frame; ends the voice itself when done
     void render (float& outL, float& outR);
     float progress() const { return len > 0.0 ? (float) (pos / len) : 0.f; } // 0..1 through the region

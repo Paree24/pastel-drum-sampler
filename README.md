@@ -11,7 +11,8 @@ replaced by user-loadable samples.
 
 - **16 generic pads** in a 4×4 pad grid (pad 1 = C1 / MIDI 36,
   chromatic up to D#2). No pad assumes a drum type.
-- **4 layers per pad**: **STACK** (all play) or **ROUND ROBIN** (cycle).
+- **4 layers per pad**: **STACK** (all play), **ROUND ROBIN** (cycle) or
+  **VELOCITY** (each layer plays inside its VEL LO..HI range, 0–127).
   Per layer: tune, fine, start, end, level, pan, reverse, normalize.
 - **Per pad**: AHDR amp envelope (HOLD = FULL plays the whole sample),
   pitch envelope, per-hit multimode filter with envelope, drive, comp, tone,
@@ -77,8 +78,13 @@ replaced by user-loadable samples.
   before files. Selecting a file previews it (PREVIEW toggle).
   Double-click or LOAD > loads it into the selected pad and layer; drag a
   row onto any pad (replaces it), layer slot or the waveform.
-- **UNDO / REDO** in the header cover kit loads, sample loads, randomize,
-  mutate, pad copy/paste/clear and region edits (30 steps).
+- **UNDO / REDO** in the header cover knob turns (one step per gesture),
+  kit loads, sample loads, randomize, mutate, pad copy/paste/clear and
+  region edits (30 steps). Kits decode in the background.
+- **Master**: lookahead peak limiter (-0.3 dBFS ceiling, 1.5 ms latency
+  reported to the host; aux outs are delayed to match), output meter.
+  The delay return can follow the host tempo (DLY SYNC, FX SEND page).
+  SCOPE (waveform toolbar) shows the selected pad's scope and spectrum.
 - **RANDOMIZE / MUTATE change timbre only**: tune, pitch envelope, filter,
   drive, tone, sends, and the colour of the effects. They never touch level,
   pan, envelopes, compression, punch, velocity response, humanize, macros,

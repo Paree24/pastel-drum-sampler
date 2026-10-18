@@ -252,8 +252,9 @@ void FxProcessor::processSlotStereo (FxSlot& slot, SlotDsp& dsp, float& l, float
 
 void FxProcessor::processChainStereo (FxChainState& chain, SlotDsp* dsps, float& l, float& r, float sr) {
     if (! chain.enabled.load()) return;
+    const auto ord = chain.order.load();   // one consistent permutation per frame
     for (int k = 0; k < FxChainState::NumSlots; ++k) {
-        int idx = chain.order[(size_t) k];
+        int idx = ord[(size_t) k];
         processSlotStereo (chain.slots[(size_t) idx], dsps[idx], l, r, sr);
     }
 }
@@ -268,8 +269,7 @@ void FxProcessor::sendReverbStereo (SlotDsp& dsp, float x, float decay, float da
     dsp.reverb.process (x, rt60FromKnob (decay), 0.3f + 0.7f * decay, damp, outL, outR);
 }
 
-void FxProcessor::sendDelayStereo (SlotDsp& dsp, float x, float time, float fb, float sr, float& outL, float& outR) {
-    float tSec = 0.02f + time * time * 1.2f;
+void FxProcessor::sendDelayStereo (SlotDsp& dsp, float x, float tSec, float fb, float sr, float& outL, float& outR) {
     int n = dsp.delayBuf.getNumSamples();
     int dLen = juce::jlimit (1, n - 2, (int) (tSec * sr));
     int rp = (dsp.delayPos - dLen + n) % n;
@@ -284,7 +284,7 @@ void FxProcessor::sendDelayStereo (SlotDsp& dsp, float x, float time, float fb, 
 
 void FxProcessor::clearChain (FxChainState& ch) {
     for (int i = 0; i < FxChainState::NumSlots; ++i) defaultSlot (FX_NONE, ch.slots[i]);
-    for (int i = 0; i < FxChainState::NumSlots; ++i) ch.order[(size_t) i] = i; // ALL slots: no duplicates, none skipped
+    ch.order.reset(); // ALL slots: no duplicates, none skipped
     ch.enabled.store (true);
 }
 
@@ -299,8 +299,9 @@ void FxProcessor::normaliseChainOrder (FxChainState& ch) {
     bool seen[FxChainState::NumSlots] = {};
     std::array<int, FxChainState::NumSlots> out {};
     int n = 0;
+    const auto in = ch.order.load();
     for (int k = 0; k < FxChainState::NumSlots; ++k) {
-        int s = ch.order[(size_t) k];
+        int s = in[(size_t) k];
         if (s >= 0 && s < FxChainState::NumSlots && ! seen[(size_t) s]) {
             seen[(size_t) s] = true;
             out[(size_t) n++] = s;
@@ -308,7 +309,7 @@ void FxProcessor::normaliseChainOrder (FxChainState& ch) {
     }
     for (int s = 0; s < FxChainState::NumSlots; ++s)
         if (! seen[(size_t) s]) out[(size_t) n++] = s;
-    ch.order = out;
+    ch.order.store (out);
 }
 
 } // namespace mds

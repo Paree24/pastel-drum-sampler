@@ -42,11 +42,16 @@ static void collectSamples (juce::ValueTree& st, const juce::File& kitFile) {
     }
 }
 
-bool loadPresetFile (SamplerProcessor& proc, const juce::File& file) {
+juce::ValueTree readKitFile (const juce::File& file) { // invalid tree = not a kit
     auto xml = juce::parseXML (file);
-    if (xml == nullptr) return false;
+    if (xml == nullptr) return {};
     auto vt = juce::ValueTree::fromXml (*xml);
-    if (! vt.isValid() || ! vt.hasType ("DRUMSAMPLER")) return false;
+    return vt.isValid() && vt.hasType ("DRUMSAMPLER") ? vt : juce::ValueTree();
+}
+
+bool loadPresetFile (SamplerProcessor& proc, const juce::File& file) {
+    auto vt = readKitFile (file);
+    if (! vt.isValid()) return false;
     proc.loadFullStateVT (vt, file.getParentDirectory(), false);
     return true;
 }
@@ -110,8 +115,10 @@ bool saveUserPreset (const juce::String& name, SamplerProcessor& proc, bool coll
 }
 
 bool loadUserPreset (const juce::File& file, SamplerProcessor& proc) {
+    auto vt = readKitFile (file);
+    if (! vt.isValid()) return false;   // nothing changed: undo + redo history stay as they were
     proc.pushUndo();
-    if (! loadPresetFile (proc, file)) { proc.undoStack.pop_back(); return false; }
+    proc.loadFullStateVT (vt, file.getParentDirectory(), false);
     proc.currentKit = -1; // user sound, not a factory slot
     proc.kitName = file.getFileNameWithoutExtension();
     return true;

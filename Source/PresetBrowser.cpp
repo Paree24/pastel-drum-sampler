@@ -167,9 +167,9 @@ void PresetBrowser::selectedRowsChanged (int) {
     if (r < 0 || r >= (int) rows.size()) return;
     auto& sel = rows[(size_t) r];
     if (sel.isUser) {
-        if (loadUserPreset (sel.file, proc)) currentFactory = -1;
+        if (proc.loadUserKitAsync (sel.file)) currentFactory = -1;
     } else {
-        proc.setCurrentProgram (sel.index);
+        proc.loadKitAsync (sel.index);   // decodes in the background; the editor refreshes when it lands
         currentFactory = sel.index;
     }
     if (onPresetChanged) onPresetChanged();

@@ -16,15 +16,24 @@ SamplerProcessor::SamplerProcessor()
     for (int i = 0; i < NumPadParams; ++i) ranges[i] = padParamRange (i);
     cacheParamPointers();
     for (auto& v : voices) v.prepare ((float) sampleRate);
+    prepareLimiter();   // usable before the host's first prepareToPlay
     initKitNoUndo();
     // first factory kit if one ships, else the blank slate
     auto& fac = getFactoryPresets();
     if (! fac.empty()) applyPreset (*this, fac.front().index);
     undoStack.clear();
+    gestureUndo.startValue.assign ((size_t) getParameters().size(), -1.f);
+    addListener (&gestureUndo);
     startTimerHz (10);
 }
 
-SamplerProcessor::~SamplerProcessor() { stopTimer(); }
+SamplerProcessor::~SamplerProcessor() {
+    *alive = false;
+    ++loadGen;                          // a decoding job stops at the next file
+    loader.removeAllJobs (true, 10000);
+    removeListener (&gestureUndo);
+    stopTimer();
+}
 
 bool SamplerProcessor::isBusesLayoutSupported (const BusesLayout& l) const {
     auto main = l.getMainOutputChannelSet();
@@ -88,9 +97,21 @@ void SamplerProcessor::prepareToPlay (double sr, int block) {
     }
     FxProcessor::prepareAll (globalDsp, FxChainState::NumSlots, spec);
     for (auto* d : { &sendRevDsp, &sendDlyDsp }) { d->prepare (spec); d->ensureHeavy (sr); d->reset(); }
+    // the send delay also runs tempo-synced: room for a 1/2 note at slow tempos
+    sendDlyDsp.delayBuf.setSize (2, (int) (sr * FxProcessor::sendDelayMaxSec) + 64, false, true, false);
+    sendDlyDsp.delayBuf.clear(); sendDlyDsp.delayPos = 0;
     globalTail = sendTail = 0;
+    prepareLimiter();
     maintenance();
     pullParams();
+}
+
+void SamplerProcessor::prepareLimiter() {
+    limiter.prepare (sampleRate);
+    auxDelayLen = limiter.latency();
+    auxDelay.assign ((size_t) (NumAuxOuts * 2 * auxDelayLen), 0.f);
+    auxDelayPos = 0;
+    setLatencySamples (limiter.latency());
 }
 
 // ---------------- audio thread ----------------
@@ -121,12 +142,20 @@ void SamplerProcessor::pullParams() {
 }
 
 SampleVoice& SamplerProcessor::allocVoice() {
-    SampleVoice* oldest = &voices[0];
+    // MaxVoices may sound at once; when they all do, the oldest one fades out
+    // (StealFadeMs) in a spare slot instead of being cut mid-waveform
+    constexpr float StealFadeMs = 4.f;
+    SampleVoice *freeV = nullptr, *oldest = nullptr, *oldestFading = nullptr;
+    int live = 0;
     for (auto& v : voices) {
-        if (! v.active) return v;
-        if (v.age < oldest->age) oldest = &v;
+        if (! v.active) { if (freeV == nullptr) freeV = &v; continue; }
+        if (v.fading()) { if (oldestFading == nullptr || v.age < oldestFading->age) oldestFading = &v; continue; }
+        ++live;
+        if (oldest == nullptr || v.age < oldest->age) oldest = &v;
     }
-    return *oldest; // hard steal (64 voices are rarely all busy)
+    if (live >= MaxVoices && oldest != nullptr) oldest->choke (StealFadeMs);
+    if (freeV != nullptr) return *freeV;
+    return oldestFading != nullptr ? *oldestFading : *oldest; // every spare slot busy fading: hard steal
 }
 
 void SamplerProcessor::startVoice (int p, int li, float vel) {
@@ -174,6 +203,10 @@ void SamplerProcessor::triggerPad (int p, float vel) {
             int li = (pe.rrNext + k) % NumLayers;
             if (pe.layers[li].hasSample()) { startVoice (p, li, vel); pe.rrNext = (li + 1) % NumLayers; break; }
         }
+    } else if (pe.layerMode.load() == LM_Velocity) {
+        const int v = juce::roundToInt (juce::jlimit (0.f, 1.f, vel) * 127.f); // lovel/hivel are MIDI 0..127
+        for (int li = 0; li < NumLayers; ++li)
+            if (pe.layers[li].velocityMatches (v)) startVoice (p, li, vel);
     } else {
         for (int li = 0; li < NumLayers; ++li) startVoice (p, li, vel);
     }
@@ -235,10 +268,18 @@ void SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     }
 
     const float sr = (float) sampleRate;
+    const double bpm = TempoSync::hostBpm (getPlayHead(), hostBpm.load());
+    hostBpm = (float) bpm;
+    const int dsync = dlySync.load();
+    const float dlySec = dsync >= 0 ? (float) TempoSync::divisionSeconds (dsync, bpm) : FxProcessor::sendDelaySeconds (dlyTime.load());
     float mg = masterGain.load();
     if (! std::isfinite (mg)) mg = 0.8f;
     auto it = midi.cbegin();
     const auto end = midi.cend();
+    const bool limitOn = limiterOn.load();
+    bool anyAux = false;
+    for (int o = 1; o <= NumAuxOuts; ++o) anyAux = anyAux || outL[o] != nullptr;
+    if (auxDelay.size() < (size_t) (NumAuxOuts * 2 * auxDelayLen)) anyAux = false; // not prepared
 
     for (int i = 0; i < N; ++i) {
         // sample-accurate MIDI
@@ -261,6 +302,7 @@ void SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             if (v.active) { sounding[v.pad] = true; v.render (pl[v.pad], pr[v.pad]); }
 
         float mainL = 0.f, mainR = 0.f, revIn = 0.f, dlyIn = 0.f;
+        float auxL[1 + NumAuxOuts] = {}, auxR[1 + NumAuxOuts] = {};
         bool anySound = false;
         for (int p = 0; p < NumPads; ++p) {
             auto& pe = pads[p];
@@ -273,6 +315,7 @@ void SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             pe.dsp.process (l, r, pe.eff[PP_Drive] * 0.01f, pe.eff[PP_Comp] * 0.01f, pe.eff[PP_Tone] * 0.01f, pe.eff[PP_Punch] * 0.01f,
                             juce::jmax (0.f, pe.eff[PP_Length]) * 0.01f);
             if (hasFx[p]) FxProcessor::processChainStereo (pe.fx, pe.fxDsp, l, r, sr);
+            pe.scope.push ((l + r) * 0.5f);
             l *= gainL[p]; r *= gainR[p];
             if (! std::isfinite (l) || ! std::isfinite (r)) { l = r = 0.f; }
             float mono = (l + r) * 0.5f;
@@ -282,15 +325,26 @@ void SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             if (m > pe.meter.load (std::memory_order_relaxed)) pe.meter.store (m, std::memory_order_relaxed);
             int o = route[p];
             if (o == 0) { mainL += l; mainR += r; }
-            else if (outR[o]) { outL[o][i] += l * mg; outR[o][i] += r * mg; }
-            else outL[o][i] += mono * mg;
+            else { auxL[o] += l * mg; auxR[o] += r * mg; }
+        }
+        if (anyAux) {   // aux buses: the limiter's lookahead as a plain delay, so every bus lines up with Main
+            for (int o = 1; o <= NumAuxOuts; ++o) {
+                if (outL[o] == nullptr) continue;
+                float* dl = auxDelay.data() + (size_t) ((o - 1) * 2 * auxDelayLen);
+                float* dr = dl + auxDelayLen;
+                const float yl = dl[auxDelayPos], yr = dr[auxDelayPos];
+                dl[auxDelayPos] = auxL[o]; dr[auxDelayPos] = auxR[o];
+                if (outR[o]) { outL[o][i] += yl; outR[o][i] += yr; }
+                else outL[o][i] += (yl + yr) * 0.5f;
+            }
+            auxDelayPos = (auxDelayPos + 1) % auxDelayLen;
         }
 
         // shared send returns ring out on their own tail after the last pad
         if (anySound) sendTail = tailLenSamples;
         if (anySound || sendTail > 0) {
             float dL = 0.f, dR = 0.f, rL = 0.f, rR = 0.f;
-            FxProcessor::sendDelayStereo (sendDlyDsp, dlyIn, dlyTime.load(), dlyFb.load(), sr, dL, dR);
+            FxProcessor::sendDelayStereo (sendDlyDsp, dlyIn, dlySec, dlyFb.load(), sr, dL, dR);
             FxProcessor::sendReverbStereo (sendRevDsp, revIn, revDecay.load(), revDamp.load(), rL, rR);
             mainL += rL + dL; mainR += rR + dR;
             if (! anySound) --sendTail;
@@ -312,17 +366,9 @@ void SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
                 previewPos += previewInc;
             } else previewVoice = nullptr;
         }
-        if (! std::isfinite (limEnv)) limEnv = 0.f;
-        if (limiterOn.load()) {
-            float peak = juce::jmax (std::abs (gL), std::abs (gR));
-            if (! std::isfinite (peak)) peak = 0.f;
-            limEnv = juce::jmax (peak, limEnv * 0.9995f);
-            if (limEnv > 1.f) { float g = 1.f / limEnv; gL *= g; gR *= g; }
-            gL = std::tanh (gL * 1.05f) * 0.95f;
-            gR = std::tanh (gR * 1.05f) * 0.95f;
-        }
         if (! std::isfinite (gL)) gL = 0.f;
         if (! std::isfinite (gR)) gR = 0.f;
+        limiter.process (&gL, &gR, 1, LimitCeiling, limitOn);   // off: same lookahead delay, no gain change
         if (outR[0]) { outL[0][i] += gL; outR[0][i] += gR; }
         else if (outL[0]) outL[0][i] += (gL + gR) * 0.5f;
         outLevel = juce::jmax (outLevel.load (std::memory_order_relaxed) * 0.9995f, juce::jmin (1.f, (std::abs (gL) + std::abs (gR)) * 0.5f));
@@ -343,7 +389,7 @@ void SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             pe.playLayer.store (newest->layer);
         } else pe.playPos.store (-1.f);
     }
-    for (auto& v : voices) if (v.active) ++nAct;
+    for (auto& v : voices) if (v.active && ! v.fading()) ++nAct;
     activeVoices = nAct;
     previewPlaying = previewVoice != nullptr;
 }
@@ -528,6 +574,8 @@ juce::ValueTree SamplerProcessor::padToVT (int p) {
         for (int i = 0; i < NumLayerParams; ++i) lv.setProperty (layerParamMeta (i).key, L.v[i].load(), nullptr);
         lv.setProperty ("rev", L.reverse.load(), nullptr);
         lv.setProperty ("norm", L.normalize.load(), nullptr);
+        lv.setProperty ("lovel", L.loVel.load(), nullptr);
+        lv.setProperty ("hivel", L.hiVel.load(), nullptr);
         v.addChild (lv, -1, nullptr);
     }
     v.addChild (pe.fx.toVT(), -1, nullptr);
@@ -539,24 +587,31 @@ static int padParamFromKey (const juce::String& key) {
     return -1;
 }
 
-void SamplerProcessor::restoreLayer (int p, int li, const juce::ValueTree& lv, const juce::File& baseDir) {
-    auto& L = pads[p].layers[li];
-    for (int i = 0; i < NumLayerParams; ++i)
-        L.v[i] = (float) lv.getProperty (layerParamMeta (i).key, layerParamMeta (i).def);
-    L.reverse = (bool) lv.getProperty ("rev", false);
-    L.normalize = (bool) lv.getProperty ("norm", false);
+// resolution order: kit-relative (collected kits travel), absolute, then
+// the bare file name next to the kit / inside "<kit> Samples"
+juce::Array<juce::File> SamplerProcessor::layerCandidates (const juce::ValueTree& lv, const juce::File& baseDir) const {
     juce::String path = lv.getProperty ("path").toString(), rel = lv.getProperty ("rel").toString();
-    L.missing = false;
-    if (path.isEmpty() && rel.isEmpty()) { L.set (nullptr); L.path = {}; return; }
-    // resolution order: kit-relative (collected kits travel), absolute, then
-    // the bare file name next to the kit / inside "<kit> Samples"
     juce::Array<juce::File> cands;
     auto base = baseDir != juce::File() ? baseDir : kitBaseDir;
     if (rel.isNotEmpty() && base != juce::File()) cands.add (base.getChildFile (rel));
     if (juce::File::isAbsolutePath (path)) cands.add (juce::File (path));
     auto fileName = rel.isNotEmpty() ? rel.fromLastOccurrenceOf ("/", false, false) : path.fromLastOccurrenceOf ("/", false, false).fromLastOccurrenceOf ("\\", false, false);
     if (base != juce::File() && fileName.isNotEmpty()) cands.add (base.getChildFile (fileName));
-    for (auto& c : cands)
+    return cands;
+}
+
+void SamplerProcessor::restoreLayer (int p, int li, const juce::ValueTree& lv, const juce::File& baseDir) {
+    auto& L = pads[p].layers[li];
+    for (int i = 0; i < NumLayerParams; ++i)
+        L.v[i] = (float) lv.getProperty (layerParamMeta (i).key, layerParamMeta (i).def);
+    L.reverse = (bool) lv.getProperty ("rev", false);
+    L.normalize = (bool) lv.getProperty ("norm", false);
+    L.loVel = juce::jlimit (0, 127, (int) lv.getProperty ("lovel", 0));
+    L.hiVel = juce::jlimit (0, 127, (int) lv.getProperty ("hivel", 127));
+    juce::String path = lv.getProperty ("path").toString(), rel = lv.getProperty ("rel").toString();
+    L.missing = false;
+    if (path.isEmpty() && rel.isEmpty()) { L.set (nullptr); L.path = {}; return; }
+    for (auto& c : layerCandidates (lv, baseDir))
         if (c.existsAsFile())
             if (auto d = loadSampleFile (c)) { L.set (d); L.path = c.getFullPathName(); return; }
     L.set (nullptr);
@@ -570,7 +625,7 @@ void SamplerProcessor::padFromVT (int p, const juce::ValueTree& v, const juce::F
     pe.output = juce::jlimit (0, NumAuxOuts, (int) v.getProperty ("out", 0));
     pe.choke = juce::jlimit (0, NumChokeGroups, (int) v.getProperty ("choke", 0));
     pe.voiceMode = juce::jlimit (0, 2, (int) v.getProperty ("voice", 0));
-    pe.layerMode = juce::jlimit (0, 1, (int) v.getProperty ("lmode", 0));
+    pe.layerMode = juce::jlimit (0, (int) LM_Velocity, (int) v.getProperty ("lmode", 0));
     pe.mute = (bool) v.getProperty ("mute", false);
     pe.solo = (bool) v.getProperty ("solo", false);
     pe.rrNext = 0;
@@ -612,6 +667,32 @@ void SamplerProcessor::pastePad (int pad) {
     ++stateVersion;
 }
 
+void SamplerProcessor::setLayerMode (int pad, int mode) {
+    auto& pe = pads[pad];
+    mode = juce::jlimit (0, (int) LM_Velocity, mode);
+    if (mode == LM_Velocity) {
+        // fresh velocity mode (every loaded layer still spans 0..127): give each loaded
+        // layer an equal slice, layer 1 softest, so switching modes is playable at once
+        int loaded[NumLayers], n = 0;
+        bool allFull = true;
+        for (int li = 0; li < NumLayers; ++li)
+            if (pe.layers[li].hasSample()) {
+                loaded[n++] = li;
+                allFull = allFull && pe.layers[li].loVel.load() == 0 && pe.layers[li].hiVel.load() == 127;
+            }
+        if (n > 1 && allFull) {
+            pushUndo();
+            for (int k = 0; k < n; ++k) {
+                pe.layers[loaded[k]].loVel = k * 128 / n;
+                pe.layers[loaded[k]].hiVel = (k + 1) * 128 / n - 1;
+            }
+        }
+    }
+    pe.layerMode = mode;
+    pe.rrNext = 0;
+    ++stateVersion;
+}
+
 void SamplerProcessor::clearPad (int pad) {
     pushUndo();
     juce::ValueTree blank ("PAD");
@@ -630,6 +711,56 @@ void SamplerProcessor::loadKit (int idx) {
     initKitNoUndo();
 }
 
+void SamplerProcessor::loadStateAsync (const juce::ValueTree& kit, const juce::File& baseDir, std::function<void()> onApplied) {
+    const int gen = ++loadGen;
+    auto apply = [this, kit, baseDir, onApplied] {
+        pushUndo();
+        applyStateVT (kit, baseDir);   // samples are pool hits now: no decoding here
+        if (onApplied) onApplied();
+        ++stateVersion;
+    };
+    if (! asyncLoads) { apply(); return; }
+    std::vector<juce::Array<juce::File>> cands;   // per layer, in restoreLayer's order
+    for (auto pad : kit)
+        if (pad.hasType ("PAD"))
+            for (auto lv : pad)
+                if (lv.hasType ("LAYER")) cands.push_back (layerCandidates (lv, baseDir));
+    ++pendingLoads;
+    loader.addJob ([this, gen, cands, apply, token = alive] {
+        std::vector<SampleData::Ptr> hold;   // keeps the decoded samples in the pool until applied
+        for (auto& list : cands) {
+            if (loadGen.load() != gen) break;   // superseded: stop decoding
+            for (auto& f : list)
+                if (auto d = loadSampleFile (f)) { hold.push_back (d); break; }
+        }
+        juce::MessageManager::callAsync ([this, gen, apply, token, hold] {
+            if (! *token) return;
+            --pendingLoads;
+            if (loadGen.load() == gen) apply();
+        });
+    });
+}
+
+void SamplerProcessor::loadKitAsync (int idx) {
+    for (auto& pr : getFactoryPresets())
+        if (pr.index == idx) {
+            auto vt = readKitFile (pr.file);
+            if (! vt.isValid()) break;
+            auto name = pr.name;
+            loadStateAsync (vt, pr.file.getParentDirectory(), [this, idx, name] { currentKit = idx; kitName = name; });
+            return;
+        }
+    loadKit (idx);   // not loadable: the synchronous path falls back to INIT
+}
+
+bool SamplerProcessor::loadUserKitAsync (const juce::File& file) {
+    auto vt = readKitFile (file);
+    if (! vt.isValid()) return false;
+    auto name = file.getFileNameWithoutExtension();
+    loadStateAsync (vt, file.getParentDirectory(), [this, name] { currentKit = -1; kitName = name; });
+    return true;
+}
+
 void SamplerProcessor::initKit() { pushUndo(); initKitNoUndo(); }
 
 void SamplerProcessor::initKitNoUndo() {
@@ -643,7 +774,7 @@ void SamplerProcessor::initKitNoUndo() {
         FxProcessor::clearChain (pads[p].fx);
     }
     FxProcessor::clearChain (globalFx);
-    revDecay = 0.5f; revDamp = 0.5f; dlyTime = 0.35f; dlyFb = 0.35f;
+    revDecay = 0.5f; revDamp = 0.5f; dlyTime = 0.35f; dlyFb = 0.35f; dlySync = -1;
     if (auto* m = dynamic_cast<juce::AudioParameterFloat*> (apvts.getParameter ("master")))
         m->setValueNotifyingHost (m->convertTo0to1 (0.8f));
     ++stateVersion;
@@ -659,6 +790,7 @@ juce::ValueTree SamplerProcessor::fullStateVT() {
     v.setProperty ("selected", selectedPad.load(), nullptr);
     v.setProperty ("revDecay", revDecay.load(), nullptr); v.setProperty ("revDamp", revDamp.load(), nullptr);
     v.setProperty ("dlyTime", dlyTime.load(), nullptr);   v.setProperty ("dlyFb", dlyFb.load(), nullptr);
+    v.setProperty ("dlySync", dlySync.load(), nullptr);
     for (int p = 0; p < NumPads; ++p) v.addChild (padToVT (p), -1, nullptr);
     juce::ValueTree g ("GLOBALFX");
     g.addChild (globalFx.toVT(), -1, nullptr);
@@ -675,6 +807,7 @@ void SamplerProcessor::applyStateVT (const juce::ValueTree& v, const juce::File&
     limiterOn = (bool) v.getProperty ("limiter", true);
     revDecay = (float) v.getProperty ("revDecay", 0.5f); revDamp = (float) v.getProperty ("revDamp", 0.5f);
     dlyTime = (float) v.getProperty ("dlyTime", 0.35f);  dlyFb = (float) v.getProperty ("dlyFb", 0.35f);
+    dlySync = juce::jlimit (-1, TempoSync::NumDivisions - 1, (int) v.getProperty ("dlySync", -1)); // older files: free time
     selectedPad = juce::jlimit (0, NumPads - 1, (int) v.getProperty ("selected", 0));
     bool seen[NumPads] = {};
     juce::ValueTree blank ("PAD");
@@ -743,22 +876,58 @@ void SamplerProcessor::setStateInformation (const void* data, int size) {
 }
 
 // ---------------- undo ----------------
-void SamplerProcessor::pushUndo() {
-    undoStack.push_back (fullStateVT());
-    if (undoStack.size() > 30) undoStack.erase (undoStack.begin());
+void SamplerProcessor::pushUndoEntry (juce::ValueTree entry) {
+    undoStack.push_back (std::move (entry));
+    if (undoStack.size() > MaxUndo) undoStack.erase (undoStack.begin());
     redoStack.clear();   // a new edit forks history
 }
+void SamplerProcessor::pushUndo() { pushUndoEntry (fullStateVT()); }
+
+juce::ValueTree SamplerProcessor::paramEntry (int index) const {
+    juce::ValueTree e ("PARAM");
+    e.setProperty ("index", index, nullptr);
+    if (auto* prm = getParameters()[index]) e.setProperty ("value", prm->getValue(), nullptr);
+    return e;
+}
+void SamplerProcessor::applyParamEntry (const juce::ValueTree& e) {
+    auto* prm = getParameters()[(int) e.getProperty ("index", -1)];
+    if (prm == nullptr) return;
+    const juce::ScopedValueSetter<bool> svs (gestureUndo.applying, true);
+    prm->beginChangeGesture();   // hosts writing automation see a normal edit
+    prm->setValueNotifyingHost ((float) e.getProperty ("value", prm->getValue()));
+    prm->endChangeGesture();
+    ++stateVersion;
+}
+
 void SamplerProcessor::undo() {
     if (undoStack.empty()) return;
     auto v = undoStack.back(); undoStack.pop_back();
+    if (v.hasType ("PARAM")) { redoStack.push_back (paramEntry ((int) v.getProperty ("index"))); applyParamEntry (v); return; }
     redoStack.push_back (fullStateVT());
     applyStateVT (v, {});
 }
 void SamplerProcessor::redo() {
     if (redoStack.empty()) return;
     auto v = redoStack.back(); redoStack.pop_back();
+    if (v.hasType ("PARAM")) { undoStack.push_back (paramEntry ((int) v.getProperty ("index"))); applyParamEntry (v); return; }
     undoStack.push_back (fullStateVT());
     applyStateVT (v, {});
+}
+
+// gestures arrive on the message thread (they come from a UI, never from host automation)
+void SamplerProcessor::GestureUndo::audioProcessorParameterChangeGestureBegin (juce::AudioProcessor*, int index) {
+    if (applying || ! juce::MessageManager::existsAndIsCurrentThread() || index < 0 || index >= (int) startValue.size()) return;
+    if (auto* prm = proc.getParameters()[index]) startValue[(size_t) index] = prm->getValue();
+}
+void SamplerProcessor::GestureUndo::audioProcessorParameterChangeGestureEnd (juce::AudioProcessor*, int index) {
+    if (applying || ! juce::MessageManager::existsAndIsCurrentThread() || index < 0 || index >= (int) startValue.size()) return;
+    const float was = startValue[(size_t) index];
+    startValue[(size_t) index] = -1.f;
+    auto* prm = proc.getParameters()[index];
+    if (was < 0.f || prm == nullptr || std::abs (prm->getValue() - was) < 1.0e-6f) return; // a click without a change
+    auto e = proc.paramEntry (index);
+    e.setProperty ("value", was, nullptr);
+    proc.pushUndoEntry (e);
 }
 
 // ---------------- randomize / mutate ----------------
@@ -834,8 +1003,6 @@ void SamplerProcessor::randomizePadFx (int p, float intensity) {
         FxProcessor::defaultSlot (type, sl);
         switch (type) {
             case FX_EQ:        sl.setParams (r (.35f,.65f), r (.35f,.65f), r (.35f,.65f), r (.35f,.65f), .5f, 1.f); break;
-            case FX_COMP:      sl.setParams (r (.45f,.75f), r (.1f,.35f), r (.1f,.4f), r (.2f,.5f), r (.3f,.6f), r (.6f,1.f)); break;
-            case FX_TRANSIENT: sl.setParams (r (.5f,.85f), r (.35f,.65f), r (.2f,.6f), r (.4f,.7f), .5f, 1.f); break;
             case FX_DIST: {
                 int a = distAlgos[liveRng.nextInt ((int) std::size (distAlgos))];
                 sl.setParams (r (.05f,.3f), r (.35f,.7f), (a + .5f) / 8.f, r (.4f,.5f), 0.f, r (.25f,.6f));
@@ -847,7 +1014,7 @@ void SamplerProcessor::randomizePadFx (int p, float intensity) {
             default: break;
         }
     }
-    for (int i = 0; i < FxChainState::NumSlots; ++i) ch.order[(size_t) i] = i;
+    ch.order.reset();
 }
 
 void SamplerProcessor::randomizeKit (float intensity) {

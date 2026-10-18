@@ -304,7 +304,9 @@ void SamplerEditor::FxChainView::moveSlot (int slot, int dir) {
         if (ch.order[(size_t) k] == act[(size_t) nidx]) posB = k;
     }
     if (posA < 0 || posB < 0) return;
-    std::swap (ch.order[(size_t) posA], ch.order[(size_t) posB]);
+    auto ord = ch.order.load();
+    std::swap (ord[(size_t) posA], ord[(size_t) posB]);
+    ch.order.store (ord);   // one atomic store: the audio thread never sees a half-done swap
     refresh();
 }
 
@@ -530,7 +532,7 @@ void PadView::paint (juce::Graphics& g) {
     if (n > 1) {
         g.setColour (col.withAlpha (0.85f));
         g.setFont (juce::Font (8.5f, juce::Font::bold));
-        g.drawText (pe.layerMode.load() == LM_RoundRobin ? "RR" : "STACK", (int) (x + w - 60), (int) dy - 3, 60, 13, juce::Justification::centredRight);
+        g.drawText (pe.layerMode.load() == LM_RoundRobin ? "RR" : (pe.layerMode.load() == LM_Velocity ? "VEL" : "STACK"), (int) (x + w - 60), (int) dy - 3, 60, 13, juce::Justification::centredRight);
     }
     int o = pe.output.load();
     if (o > 0) {
@@ -627,7 +629,16 @@ void LayerCell::paint (juce::Graphics& g) {
     if (L.missing) nm = "MISSING " + nm;
     g.setColour (L.missing ? kRed : (has ? kText : kDim));
     g.setFont (juce::Font (10.f));
-    g.drawText (nm, r.withTrimmedLeft (25.f).withTrimmedRight (14.f), juce::Justification::centredLeft, true);
+    float velW = 0.f;
+    if (has && pe.layerMode.load() == LM_Velocity) {   // velocity range, right-aligned
+        velW = 46.f;
+        g.setColour (col.withAlpha (0.85f));
+        g.setFont (juce::Font (9.f, juce::Font::bold));
+        g.drawText (juce::String (L.loVel.load()) + "-" + juce::String (L.hiVel.load()), r.withTrimmedRight (5.f), juce::Justification::centredRight);
+        g.setColour (L.missing ? kRed : kText);
+        g.setFont (juce::Font (10.f));
+    }
+    g.drawText (nm, r.withTrimmedLeft (25.f).withTrimmedRight (14.f + velW), juce::Justification::centredLeft, true);
     if (has && pe.layerMode.load() == LM_RoundRobin && proc.numLoadedLayers (p) > 1) {
         // next round-robin layer to fire
         int nxt = pe.rrNext.load();
@@ -1085,7 +1096,7 @@ SamplerEditor::SamplerEditor (SamplerProcessor& p) : juce::AudioProcessorEditor 
         for (size_t i = 0; i < all.size(); ++i)
             if (all[i].index == proc.currentKit) { pos = (int) i; break; }
         int npos = (pos + dir + (int) all.size()) % (int) all.size();
-        proc.setCurrentProgram (all[(size_t) npos].index);
+        proc.loadKitAsync (all[(size_t) npos].index);
         refreshAll();
     };
     prevB.onClick = [this, stepProgram] { stepProgram (-1); };
@@ -1103,7 +1114,7 @@ SamplerEditor::SamplerEditor (SamplerProcessor& p) : juce::AudioProcessorEditor 
     randKitB.onClick = [this] { proc.randomizeKit (0.7f); proc.maintenance(); refreshAll(); };
     undoB.onClick = [this] { proc.undo(); refreshAll(); };
     redoB.onClick = [this] { proc.redo(); refreshAll(); };
-    undoB.setTooltip ("Undo the last kit change"); redoB.setTooltip ("Redo what UNDO took back");
+    undoB.setTooltip ("Undo the last change: knob turns, kit and sample edits"); redoB.setTooltip ("Redo what UNDO took back");
     initB.onClick = [this] { proc.initKit(); refreshAll(); };
     randPartB.setColour (juce::Slider::rotarySliderFillColourId, kAccent);
     randPartB.setTooltip ("Randomize timbre only: tune, pitch env, filter, drive, tone, sends, effect colour.\n"
@@ -1190,14 +1201,25 @@ SamplerEditor::SamplerEditor (SamplerProcessor& p) : juce::AudioProcessorEditor 
     layersLab.setFont (juce::Font (9.5f, juce::Font::bold));
     layersLab.setColour (juce::Label::textColourId, kLab);
     samplePanel.addAndMakeVisible (layersLab);
-    for (auto* b : { &stackB, &rrB }) { b->setClickingTogglesState (true); samplePanel.addAndMakeVisible (*b); }
+    for (auto* b : { &stackB, &rrB, &velB }) { b->setClickingTogglesState (true); samplePanel.addAndMakeVisible (*b); }
     stackB.setTooltip ("STACK: every loaded layer plays on each hit");
     rrB.setTooltip ("ROUND ROBIN: hits cycle through the loaded layers");
-    stackB.onClick = [this] { proc.pads[sel()].layerMode = LM_Stack; refreshHeader(); };
-    rrB.onClick = [this] { proc.pads[sel()].layerMode = LM_RoundRobin; proc.pads[sel()].rrNext = 0; refreshHeader(); };
+    velB.setTooltip ("VELOCITY: each layer plays only inside its velocity range (VEL LO / VEL HI below)");
+    stackB.onClick = [this] { proc.setLayerMode (sel(), LM_Stack); refreshAll(); };
+    rrB.onClick = [this] { proc.setLayerMode (sel(), LM_RoundRobin); refreshAll(); };
+    velB.onClick = [this] { proc.setLayerMode (sel(), LM_Velocity); refreshAll(); };
     for (int l = 0; l < NumLayers; ++l) { layerCells.push_back (std::make_unique<LayerCell> (l, *this)); samplePanel.addAndMakeVisible (*layerCells.back()); }
     samplePanel.addAndMakeVisible (wave);
     for (auto* b : { &prevFileB, &nextFileB, &loadB, &revB, &normB, &clearB }) wave.addAndMakeVisible (*b);
+    wave.addChildComponent (padScope); wave.addChildComponent (padSpectrum);
+    wave.addAndMakeVisible (scopeB);
+    scopeB.setClickingTogglesState (true);
+    scopeB.setTooltip ("Show the selected pad's output as a scope and spectrum instead of the waveform");
+    scopeB.onClick = [this] {
+        bool on = scopeB.getToggleState();
+        padScope.setVisible (on); padSpectrum.setVisible (on);
+        wave.repaint();
+    };
     prevFileB.setTooltip ("Previous file in this folder"); nextFileB.setTooltip ("Next file in this folder");
     prevFileB.onClick = [this] { stepLayerFile (-1); };
     nextFileB.onClick = [this] { stepLayerFile (+1); };
@@ -1238,7 +1260,7 @@ SamplerEditor::SamplerEditor (SamplerProcessor& p) : juce::AudioProcessorEditor 
     addAndMakeVisible (globalPanel);
 
     // footer
-    addAndMakeVisible (outTitle); addAndMakeVisible (masterFader); addAndMakeVisible (limitB);
+    addAndMakeVisible (outTitle); addAndMakeVisible (masterFader); addAndMakeVisible (limitB); addAndMakeVisible (outMeter);
     masterFader.setColour (juce::Slider::thumbColourId, kAccent);
     masterFader.setColour (juce::Slider::trackColourId, kAccent.withAlpha (0.5f));
     masterFader.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff2a2a34));
@@ -1259,6 +1281,16 @@ SamplerEditor::SamplerEditor (SamplerProcessor& p) : juce::AudioProcessorEditor 
 }
 
 SamplerEditor::~SamplerEditor() { stopTimer(); setLookAndFeel (nullptr); }
+
+ScopeSource SamplerEditor::selectedScope() const {
+    ScopeSource s;
+    int p = sel();
+    s.tap = &proc.pads[p].scope;
+    s.colour = padColour (p);
+    s.title = "PAD " + juce::String (p + 1);
+    s.sampleRate = proc.currentSampleRate();
+    return s;
+}
 
 // ---------------- knobs ----------------
 std::unique_ptr<Knob> SamplerEditor::makePadKnob (int p, int param) {
@@ -1364,6 +1396,23 @@ void SamplerEditor::rebuildPage() {
             for (int lp = 0; lp < NumLayerParams; ++lp) row1.push_back (makeLayerKnob (p, li, lp));
             padRow (row2, { PP_Drive, PP_Comp, PP_Tone, PP_Punch });
             l1 = "LAYER " + juce::String (li + 1); l2 = "PAD";
+            if (proc.pads[p].layerMode.load() == LM_Velocity) {   // this layer's velocity range
+                for (int hi = 0; hi < 2; ++hi) {
+                    auto& L = proc.pads[p].layers[li];
+                    auto& tgt = hi ? L.hiVel : L.loVel;
+                    auto kb = std::make_unique<Knob> (hi ? "VEL HI" : "VEL LO", col);
+                    kb->val.setColour (juce::Label::textColourId, col.brighter (0.2f));
+                    kb->setManual ((float) tgt.load() / 127.f, [this, &L, hi] (float v01) {
+                        int v = juce::roundToInt (v01 * 127.f);
+                        if (hi) L.hiVel = juce::jmax (v, L.loVel.load()); else L.loVel = juce::jmin (v, L.hiVel.load());
+                        for (auto& c : layerCells) c->repaint();
+                    }, [] (float v01) { return juce::String (juce::roundToInt (v01 * 127.f)); });
+                    kb->s.setRange (0.0, 1.0, 1.0 / 127.0);
+                    kb->s.setDoubleClickReturnValue (true, hi ? 1.0 : 0.0);
+                    row2.push_back (std::move (kb));
+                }
+                l2 = "PAD  |  LAYER " + juce::String (li + 1) + " VELOCITY RANGE";
+            }
             break;
         case 1:
             padRow (row1, { PP_Attack, PP_Hold, PP_Decay, PP_Release, PP_Level, PP_Pan });
@@ -1383,8 +1432,28 @@ void SamplerEditor::rebuildPage() {
             auto pct = [] (float v) { return juce::String (juce::roundToInt (v * 100)) + "%"; };
             row2.push_back (makeAtomicKnob ("REV DECAY", proc.revDecay, [] (float v) { return juce::String (FxProcessor::rt60FromKnob (v), 2) + " s"; }, -1));
             row2.push_back (makeAtomicKnob ("REV DAMP", proc.revDamp, pct, -1));
-            row2.push_back (makeAtomicKnob ("DLY TIME", proc.dlyTime, [] (float v) { return juce::String (juce::roundToInt ((0.02f + v * v * 1.2f) * 1000.f)) + " ms"; }, -1));
+            auto* pr = &proc;
+            auto dlyFmt = [pr] (float v) {
+                int d = pr->dlySync.load();
+                float sec = d >= 0 ? (float) TempoSync::divisionSeconds (d, pr->hostBpm.load()) : FxProcessor::sendDelaySeconds (v);
+                return (d >= 0 ? juce::String (TempoSync::divisionName (d)) + "  " : juce::String()) + juce::String (juce::roundToInt (sec * 1000.f)) + " ms";
+            };
+            row2.push_back (makeAtomicKnob ("DLY TIME", proc.dlyTime, dlyFmt, -1));
+            auto* timeK = row2.back().get();
             row2.push_back (makeAtomicKnob ("DLY FDBK", proc.dlyFb, pct, -1));
+            // DLY SYNC: FREE, then the shared tempo divisions (host tempo, 120 BPM without one)
+            constexpr int steps = TempoSync::NumDivisions;
+            auto sk = std::make_unique<Knob> ("DLY SYNC", col);
+            sk->val.setColour (juce::Label::textColourId, col.brighter (0.2f));
+            sk->setManual ((float) (proc.dlySync.load() + 1) / steps, [pr, timeK] (float v) {
+                pr->dlySync = juce::roundToInt (v * steps) - 1;
+                timeK->s.setAlpha (pr->dlySync.load() >= 0 ? 0.45f : 1.f);
+                timeK->val.setText (timeK->fmtr ((float) timeK->s.getValue()), juce::dontSendNotification);
+            }, [] (float v) { int d = juce::roundToInt (v * steps) - 1; return d < 0 ? juce::String ("FREE") : juce::String (TempoSync::divisionName (d)); });
+            sk->s.setRange (0.0, 1.0, 1.0 / steps);
+            sk->s.setTooltip ("FREE: DLY TIME sets the delay. Otherwise the delay follows the host tempo.");
+            timeK->s.setAlpha (proc.dlySync.load() >= 0 ? 0.45f : 1.f);
+            row2.push_back (std::move (sk));
             l1 = "SENDS"; l2 = "SHARED RETURNS (ALL PADS)";
             break;
         }
@@ -1416,10 +1485,11 @@ void SamplerEditor::refreshHeader() {
     outBox.setText (outBox.getItemText (outBox.getSelectedItemIndex()), juce::dontSendNotification); // shows "(off)" too
     chokeBox.setSelectedId (pe.choke.load() + 1, juce::dontSendNotification);
     voiceBox.setSelectedId (pe.voiceMode.load() + 1, juce::dontSendNotification);
-    bool rr = pe.layerMode.load() == LM_RoundRobin;
-    stackB.setToggleState (! rr, juce::dontSendNotification);
-    rrB.setToggleState (rr, juce::dontSendNotification);
-    for (auto* b : { &stackB, &rrB, &trigB }) b->setColour (juce::Slider::rotarySliderFillColourId, col);
+    const int lm = pe.layerMode.load();
+    stackB.setToggleState (lm == LM_Stack, juce::dontSendNotification);
+    rrB.setToggleState (lm == LM_RoundRobin, juce::dontSendNotification);
+    velB.setToggleState (lm == LM_Velocity, juce::dontSendNotification);
+    for (auto* b : { &stackB, &rrB, &velB, &trigB }) b->setColour (juce::Slider::rotarySliderFillColourId, col);
     auto& L = pe.layers[selLayer()];
     revB.setToggleState (L.reverse.load(), juce::dontSendNotification);
     normB.setToggleState (L.normalize.load(), juce::dontSendNotification);
@@ -1444,7 +1514,21 @@ void SamplerEditor::refreshFxRows() {
     limitB.setToggleState (proc.limiterOn.load(), juce::dontSendNotification);
 }
 
+// the selected pad's colour drives the shared accent: view tabs, toggles, output
+// fader and limiter all follow the pad being edited
+void SamplerEditor::applyPadAccent (int p) {
+    const auto col = padColour (p);
+    lnf.accent = col;
+    lnf.setColour (juce::Slider::rotarySliderFillColourId, col);
+    for (auto* b : { &viewSample, &viewPartFx, &viewGlobFx, &viewBrowser })
+        b->setColour (juce::Slider::rotarySliderFillColourId, col);
+    masterFader.setColour (juce::Slider::thumbColourId, col);
+    masterFader.setColour (juce::Slider::trackColourId, col.withAlpha (0.5f));
+    repaint();
+}
+
 void SamplerEditor::refreshAll() {
+    applyPadAccent (sel());
     refreshHeader();
     rebuildPage();
     refreshFxRows();
@@ -1554,6 +1638,7 @@ void SamplerEditor::resized() {
     auto orr = footerRect.reduced (8);
     outTitle.setBounds (orr.removeFromLeft (80).reduced (2));
     limitB.setBounds (orr.removeFromRight (90).reduced (14, 8));
+    outMeter.setBounds (orr.removeFromRight (180).reduced (4, 12));
     masterFader.setBounds (orr.reduced (2));
 
     // pads: 4x4 grid, pad 1 bottom-left
@@ -1614,6 +1699,7 @@ void SamplerEditor::resized() {
     layersLab.setBounds (lr.removeFromLeft (50));
     stackB.setBounds (lr.removeFromLeft (56));
     rrB.setBounds (lr.removeFromLeft (92));
+    velB.setBounds (lr.removeFromLeft (70));
     lr.removeFromLeft (8);
     int cw = (lr.getWidth() - 3 * 4) / NumLayers;
     for (int l = 0; l < NumLayers; ++l) layerCells[(size_t) l]->setBounds (lr.getX() + l * (cw + 4), lr.getY(), cw, lr.getHeight());
@@ -1629,7 +1715,11 @@ void SamplerEditor::resized() {
         revB.setBounds (wb.removeFromRight (66)); wb.removeFromRight (3);
         loadB.setBounds (wb.removeFromRight (60)); wb.removeFromRight (3);
         nextFileB.setBounds (wb.removeFromRight (20)); wb.removeFromRight (2);
-        prevFileB.setBounds (wb.removeFromRight (20));
+        prevFileB.setBounds (wb.removeFromRight (20)); wb.removeFromRight (3);
+        scopeB.setBounds (wb.removeFromRight (56));
+        auto pa = wave.plotArea().toNearestInt();
+        padScope.setBounds (pa.removeFromLeft (pa.getWidth() / 2).reduced (2));
+        padSpectrum.setBounds (pa.reduced (2));
     }
     auto layoutRow = [] (std::vector<std::unique_ptr<Knob>>& row, juce::Label& lab, juce::Rectangle<int> area) {
         lab.setBounds (area.removeFromTop (14));
@@ -1680,10 +1770,12 @@ void SamplerEditor::timerCallback() {
         kitLab.setText (style.isEmpty() ? proc.kitName : proc.kitName + "  |  " + style, juce::dontSendNotification);
         presetBtn.setButtonText (proc.kitName);
     }
+    presetBtn.setButtonText (proc.isLoadingKit() ? juce::String ("LOADING...") : proc.kitName);
     undoB.setEnabled (! proc.undoStack.empty());
     redoB.setEnabled (! proc.redoStack.empty());
     voiceLab.setText ("VOICES " + juce::String (proc.activeVoices.load()) + " / " + juce::String (MaxVoices), juce::dontSendNotification);
     for (auto& pv : padViews) pv->tick();
+    outMeter.repaint();
     if (mainView == 0) {
         wave.repaint();
         for (auto& c : layerCells) c->repaint();

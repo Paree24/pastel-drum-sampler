@@ -36,6 +36,7 @@ bool deleteFactoryShadow (int index); // restores the shipped file (true if one 
 
 // ---- loading / saving kit state files (factory + user share the format) ----
 bool loadPresetFile (SamplerProcessor& proc, const juce::File& file); // no undo step (callers push)
+juce::ValueTree readKitFile (const juce::File& file);                  // parsed kit, or an invalid tree
 // collect: copy samples into "<file stem> Samples/" and reference them relatively
 bool savePresetFile (SamplerProcessor& proc, const juce::File& file, bool collect = false);
 

@@ -2,7 +2,10 @@
 #include <JuceHeader.h>
 #include "dsp/SampleEngine.h"
 #include "dsp/Effects.h"
+#include "dsp/Limiter.h"
+#include "dsp/TempoSync.h"
 #include "Presets.h"
+#include "Visuals.h"
 
 namespace mds {
 
@@ -57,6 +60,7 @@ public:
         std::atomic<int> hits { 0 };
         std::atomic<int> playLayer { -1 };
         std::atomic<float> playPos { -1.f };  // 0..1 across the whole file, -1 = idle
+        ScopeTap scope;                    // post-FX, pre-level mono (freezes when the pad's tail ends)
         // UI -> audio audition (velocity, 0 = none)
         std::atomic<float> pendingTrig { 0.f };
     };
@@ -65,6 +69,8 @@ public:
     FxChainState globalFx;
     SlotDsp globalDsp[FxChainState::NumSlots];
     std::atomic<float> revDecay { 0.5f }, revDamp { 0.5f }, dlyTime { 0.35f }, dlyFb { 0.35f };
+    std::atomic<int> dlySync { -1 };          // delay return: -1 = free (DLY TIME), else a TempoSync division
+    std::atomic<float> hostBpm { 120.f };     // last tempo read from the playhead (UI readout)
     SlotDsp sendRevDsp, sendDlyDsp;
     std::atomic<float> masterGain { 0.8f };
     std::atomic<bool> limiterOn { true };
@@ -84,6 +90,7 @@ public:
     void loadPadFiles (int pad, const juce::Array<juce::File>& files); // replaces the pad's layers
     void clearLayer (int pad, int layer, bool undoable = true);
     void clearPad (int pad);
+    void setLayerMode (int pad, int mode);   // VELOCITY on full-range layers splits 0..127 evenly first
     juce::String padDisplayName (int pad) const;
     int numLoadedLayers (int pad) const;
     void auditionPad (int pad, float velocity = 0.85f) { pads[juce::jlimit (0, NumPads - 1, pad)].pendingTrig.store (velocity); }
@@ -115,6 +122,14 @@ public:
     void initKit();
     void initKitNoUndo();
     juce::ValueTree fullStateVT();
+    // kit loads off the message thread: the samples decode on a worker thread,
+    // then the state is applied here on the message thread as one undo step.
+    // A newer request supersedes one still decoding. setAsyncLoads (false) = inline (tests).
+    void loadStateAsync (const juce::ValueTree& kit, const juce::File& baseDir, std::function<void()> onApplied = {});
+    void loadKitAsync (int factoryIdx);
+    bool loadUserKitAsync (const juce::File& file);   // false: not a kit file (nothing changes)
+    void setAsyncLoads (bool a) { asyncLoads = a; }
+    bool isLoadingKit() const { return pendingLoads.load() > 0; }
     void loadFullStateVT (const juce::ValueTree&, const juce::File& baseDir = {}, bool undoable = true);
 
     // randomize locks (session state, saved with the DAW project): every pad
@@ -130,10 +145,13 @@ public:
     void mutatePad (int pad, float amount = 0.25f);
     void mutateKit (float amount = 0.18f);
 
+    // one history for everything: full-state snapshots (kit edits) and single
+    // parameter steps ("PARAM", recorded per knob gesture: begin..end = one step)
     void pushUndo();
     void undo();
     void redo();
     std::vector<juce::ValueTree> undoStack, redoStack;
+    static constexpr size_t MaxUndo = 30;
 
     bool locks[NumPads][NumLocks] = {};
 
@@ -145,13 +163,16 @@ public:
 private:
     double sampleRate = 44100.0;
     juce::dsp::ProcessSpec spec {};
-    float limEnv = 0.f;
+    static constexpr float LimitCeiling = 0.9661f;   // -0.3 dBFS
+    PeakLimiter limiter;                              // Main only; its lookahead is the plugin latency
+    std::vector<float> auxDelay;                      // aux buses delayed by the same lookahead (stay in sync with Main)
+    int auxDelayLen = 1, auxDelayPos = 0;
     int globalTail = 0, sendTail = 0, tailLenSamples = 44100 * 4;
     juce::uint32 voiceStamp = 0;
     juce::Random liveRng { (juce::uint32) juce::Time::currentTimeMillis() };
     juce::Random audioRng { 0x5eed };
 
-    SampleVoice voices[MaxVoices];
+    SampleVoice voices[MaxVoices + StealVoices];
     std::atomic<float>* padRaw[NumPads][NumPadParams] = {};
     juce::AudioParameterFloat* padPar[NumPads][NumPadParams] = {};
     juce::AudioParameterFloat* macroPar[NumPads][NumMacros] = {};
@@ -172,6 +193,7 @@ private:
     static BusesProperties makeBuses();
     juce::AudioProcessorValueTreeState::ParameterLayout makeLayout();
     void cacheParamPointers();
+    void prepareLimiter();                  // limiter + aux delay lines; sets the plugin latency
     void pullParams();                      // audio thread: APVTS + macros -> eff
     void triggerPad (int pad, float vel);   // audio thread
     void startVoice (int pad, int layer, float vel);
@@ -179,7 +201,31 @@ private:
     void releasePad (int pad);
     void timerCallback() override { maintenance(); }
     void restoreLayer (int pad, int layer, const juce::ValueTree& lv, const juce::File& baseDir);
+    juce::Array<juce::File> layerCandidates (const juce::ValueTree& lv, const juce::File& baseDir) const;
+
+    // knob-turn undo: every change gesture on an automatable parameter (editor
+    // knobs, an embedding host's UI) becomes one PARAM step on the undo stack
+    struct GestureUndo : juce::AudioProcessorListener {
+        explicit GestureUndo (SamplerProcessor& p) : proc (p) {}
+        void audioProcessorParameterChanged (juce::AudioProcessor*, int, float) override {}
+        void audioProcessorChanged (juce::AudioProcessor*, const ChangeDetails&) override {}
+        void audioProcessorParameterChangeGestureBegin (juce::AudioProcessor*, int index) override;
+        void audioProcessorParameterChangeGestureEnd (juce::AudioProcessor*, int index) override;
+        SamplerProcessor& proc;
+        std::vector<float> startValue;   // normalised value at gesture start, -1 = no gesture (message thread)
+        bool applying = false;           // undo/redo is moving a parameter: don't record it
+    };
+    GestureUndo gestureUndo { *this };
+    void pushUndoEntry (juce::ValueTree entry);
+    juce::ValueTree paramEntry (int index) const;   // PARAM step holding the parameter's current value
+    void applyParamEntry (const juce::ValueTree&);
     void applyStateVT (const juce::ValueTree&, const juce::File& baseDir);
+
+    // background kit loader (declared last: destroyed first, before the pool it fills)
+    bool asyncLoads = true;
+    std::atomic<int> loadGen { 0 }, pendingLoads { 0 };
+    std::shared_ptr<bool> alive = std::make_shared<bool> (true);   // message thread: callbacks after deletion bail out
+    juce::ThreadPool loader { juce::ThreadPoolOptions {}.withThreadName ("Kit loader").withNumberOfThreads (1) };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SamplerProcessor)
 };
