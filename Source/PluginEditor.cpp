@@ -1,24 +1,29 @@
 #include "PluginEditor.h"
+#include "SamplerAssets.h"
 #include "PresetBrowser.h"
 
 namespace mds {
 
-static const juce::Colour kBg (0xff101014), kPanel (0xff17171d), kPanelSel (0xff22222c), kRaised (0xff232330),
-                          kEdge (0xff2a2a36), kText (0xffe8e8ee), kLab (0xff9a9aa8), kDim (0xff6a6a78),
-                          kAccent (0xfff49ac1), kGreen (0xffa3e635), kAmber (0xfffbbf24), kRed (0xfff87171);
+// v3 palette (shared with Pastel Drum Synth / EFX Grid)
+static const juce::Colour kBg (0xff141518), kPanel (0xff1c1f24), kPanelSel (0xff23262b), kRaised (0xff232529),
+                          kEdge (0xff33363c), kText (0xffd9d5d0), kLab (0xff8f8b85), kDim (0xff5c5a56),
+                          kAccent (0xffe9a3b8), kGreen (0xffa9d58e), kAmber (0xffe8b86a), kRed (0xffe88a8a);
 
 // ================= LNF =================
 PastelLNF::PastelLNF() {
+    latoReg   = juce::Typeface::createSystemTypefaceFor (SamplerAssets::LatoRegular_ttf, SamplerAssets::LatoRegular_ttfSize);
+    latoBold  = juce::Typeface::createSystemTypefaceFor (SamplerAssets::LatoBold_ttf, SamplerAssets::LatoBold_ttfSize);
+    latoBlack = juce::Typeface::createSystemTypefaceFor (SamplerAssets::LatoBlack_ttf, SamplerAssets::LatoBlack_ttfSize);
     setColour (juce::ResizableWindow::backgroundColourId, kBg);
-    setColour (juce::ComboBox::backgroundColourId, juce::Colour (0xff1c1c22));
+    setColour (juce::ComboBox::backgroundColourId, kRaised);
     setColour (juce::ComboBox::textColourId, kText);
     setColour (juce::ComboBox::arrowColourId, kLab);
     setColour (juce::TextButton::buttonColourId, kRaised);
     setColour (juce::TextButton::textColourOnId, kBg);
-    setColour (juce::Label::textColourId, juce::Colour (0xffb8b8c4));
+    setColour (juce::Label::textColourId, kLab);
     setColour (juce::Slider::rotarySliderFillColourId, accent);
-    setColour (juce::Slider::trackColourId, juce::Colour (0xff2a2a34));
-    setColour (juce::PopupMenu::backgroundColourId, juce::Colour (0xff1c1c22));
+    setColour (juce::Slider::trackColourId, kEdge);
+    setColour (juce::PopupMenu::backgroundColourId, kRaised);
     setColour (juce::PopupMenu::textColourId, kText);
     setColour (juce::PopupMenu::headerTextColourId, kLab);
     setColour (juce::PopupMenu::highlightedBackgroundColourId, accent.withAlpha (0.25f));
@@ -28,51 +33,80 @@ PastelLNF::PastelLNF() {
     setColour (juce::TextEditor::highlightColourId, accent.withAlpha (0.35f));
     setColour (juce::Label::textWhenEditingColourId, kText);
     setColour (juce::Label::backgroundWhenEditingColourId, kRaised);
-    setColour (juce::TooltipWindow::backgroundColourId, juce::Colour (0xff1c1c22));
+    setColour (juce::TooltipWindow::backgroundColourId, kRaised);
     setColour (juce::TooltipWindow::textColourId, kText);
 }
+// every plain juce::Font in the editor resolves to the embedded Lato
+juce::Typeface::Ptr PastelLNF::getTypefaceForFont (const juce::Font& f) {
+    if (f.getTypefaceName() == juce::Font::getDefaultSansSerifFontName() && latoReg != nullptr)
+        return f.isBold() ? latoBold : latoReg;
+    return juce::LookAndFeel_V4::getTypefaceForFont (f);
+}
+juce::Font PastelLNF::getTextButtonFont (juce::TextButton&, int h) { return juce::Font (juce::jmin (12.f, h * 0.5f), juce::Font::bold); }
+void PastelLNF::drawPopupMenuBackground (juce::Graphics& g, int w, int h) {
+    g.setColour (kPanel);
+    g.fillRoundedRectangle (0, 0, (float) w, (float) h, 6.f);
+    g.setColour (kEdge);
+    g.drawRoundedRectangle (0.5f, 0.5f, w - 1.f, h - 1.f, 6.f, 1.f);
+}
+// arc knob: neutral track, accent value arc (bipolar = from 12 o'clock), body + needle
 void PastelLNF::drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h, float pos,
                                   float start, float end, juce::Slider& sl) {
     auto ac = sl.findColour (juce::Slider::rotarySliderFillColourId);
-    auto cx = x + w * 0.5f, cy = y + h * 0.5f - 6.f, r = juce::jmin (w, h) * 0.32f;
-    g.setColour (juce::Colour (0xff1e1e26));
-    g.fillEllipse (cx - r - 3, cy - r - 3, (r + 3) * 2, (r + 3) * 2);
-    g.setColour (juce::Colour (0xff2c2c38));
-    g.drawEllipse (cx - r - 3, cy - r - 3, (r + 3) * 2, (r + 3) * 2, 1.2f);
+    const float cx = x + w * 0.5f, cy = y + h * 0.5f;
+    const float r = juce::jmin (juce::jmin (w, h) * 0.5f - 3.f, 34.f);   // calm: no giant dials
+    const float sw = juce::jmax (2.6f, r * 0.15f), arcR = r - sw * 0.5f;
+    const auto stroke = juce::PathStrokeType (sw, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
     juce::Path track;
-    track.addArc (cx - r, cy - r, r * 2, r * 2, start, end, true);
-    g.setColour (juce::Colour (0xff33333f));
-    g.strokePath (track, juce::PathStrokeType (3.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-    float ang = start + (end - start) * pos;
-    // bipolar knobs fill from the centre (tune, pan, macros...)
-    float from = (bool) sl.getProperties()["bipolar"] ? (start + end) * 0.5f : start;
+    track.addCentredArc (cx, cy, arcR, arcR, 0.f, start, end, true);
+    g.setColour (juce::Colour (0xff3a3d43));
+    g.strokePath (track, stroke);
+    const float ang = start + (end - start) * pos;
+    const float from = (bool) sl.getProperties()["bipolar"] ? (start + end) * 0.5f : start;
     if (std::abs (ang - from) > 0.01f) {
         juce::Path fill;
-        fill.addArc (cx - r, cy - r, r * 2, r * 2, juce::jmin (from, ang), juce::jmax (from, ang), true);
+        fill.addCentredArc (cx, cy, arcR, arcR, 0.f, juce::jmin (from, ang), juce::jmax (from, ang), true);
         g.setColour (ac);
-        g.strokePath (fill, juce::PathStrokeType (3.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        g.strokePath (fill, stroke);
     }
-    g.setColour (juce::Colours::white.withAlpha (0.92f));
-    g.drawLine (cx, cy, cx + std::cos (ang - juce::MathConstants<float>::halfPi) * r * 0.75f,
-                cy + std::sin (ang - juce::MathConstants<float>::halfPi) * r * 0.75f, 2.f);
+    const float br = r - sw - 2.f;
+    g.setColour (juce::Colour (0xff26292f));
+    g.fillEllipse (cx - br, cy - br, br * 2, br * 2);
+    g.setColour (juce::Colour (0xff3a3d43));
+    g.drawEllipse (cx - br, cy - br, br * 2, br * 2, 1.f);
+    g.setColour (juce::Colour (0xfff4f1ec));
+    g.drawLine (cx + std::sin (ang) * br * 0.25f, cy - std::cos (ang) * br * 0.25f,
+                cx + std::sin (ang) * (br - 2.f), cy - std::cos (ang) * (br - 2.f), 2.f);
 }
 void PastelLNF::drawLinearSlider (juce::Graphics& g, int x, int y, int w, int h, float pos,
                                   float, float, juce::Slider::SliderStyle style, juce::Slider& sl) {
-    if (style != juce::Slider::LinearVertical) { LookAndFeel_V4::drawLinearSlider (g, x, y, w, h, pos, 0, 1, style, sl); return; }
     auto ac = sl.findColour (juce::Slider::rotarySliderFillColourId);
-    float cx = x + w * 0.5f;
-    g.setColour (juce::Colour (0xff26262f));
-    g.fillRoundedRectangle (cx - 3, (float) y + 4, 6, (float) h - 8, 3.f);
-    float fh = (h - 12) * pos;
-    g.setColour (ac.withAlpha (0.85f));
-    g.fillRoundedRectangle (cx - 3, (float) (y + h - 6) - fh, 6, fh, 3.f);
-    g.setColour (juce::Colour (0xffd8d8e2));
-    g.fillRoundedRectangle (cx - 11, (float) (y + h - 8) - fh, 22, 7, 2.f);
+    if (style == juce::Slider::LinearVertical) {
+        float cx = x + w * 0.5f;
+        g.setColour (kEdge);
+        g.fillRoundedRectangle (cx - 2, (float) y + 4, 4, (float) h - 8, 2.f);
+        float fh = (h - 12) * pos;
+        g.setColour (ac);
+        g.fillRoundedRectangle (cx - 2, (float) (y + h - 6) - fh, 4, fh, 2.f);
+        g.setColour (juce::Colour (0xfff4f1ec));
+        g.fillRoundedRectangle (cx - 11, (float) (y + h - 9) - fh, 22, 8, 3.f);
+        return;
+    }
+    // thin track + round handle (pos arrives in pixels)
+    ac = sl.findColour (juce::Slider::thumbColourId);
+    const float cy = y + h * 0.5f, l = (float) x + 6.f, rr = (float) (x + w) - 6.f;
+    const float px = juce::jlimit (l, rr, pos);
+    g.setColour (kEdge);
+    g.fillRoundedRectangle (l, cy - 2.f, rr - l, 4.f, 2.f);
+    g.setColour (ac);
+    g.fillRoundedRectangle (l, cy - 2.f, px - l, 4.f, 2.f);
+    g.setColour (juce::Colour (0xfff4f1ec));
+    g.fillEllipse (px - 7.f, cy - 7.f, 14.f, 14.f);
 }
 void PastelLNF::drawComboBox (juce::Graphics& g, int w, int h, bool, int, int, int, int, juce::ComboBox& box) {
     g.setColour (box.findColour (juce::ComboBox::backgroundColourId));
     g.fillRoundedRectangle (0, 0, (float) w, (float) h, 5.f);
-    g.setColour (juce::Colour (0xff34343f));
+    g.setColour (juce::Colour (0xff3a3d43));
     g.drawRoundedRectangle (0.5f, 0.5f, (float) w - 1, (float) h - 1, 5.f, 1.f);
     juce::Path arrow;
     float ax = (float) w - 14.f, ay = h * 0.5f - 2.f;
@@ -80,15 +114,17 @@ void PastelLNF::drawComboBox (juce::Graphics& g, int w, int h, bool, int, int, i
     g.setColour (kLab);
     g.strokePath (arrow, juce::PathStrokeType (1.4f));
 }
+// toggled buttons fill with their accent (dark text); the rest are dark with a thin edge
 void PastelLNF::drawButtonBackground (juce::Graphics& g, juce::Button& b, const juce::Colour& bg, bool hov, bool down) {
     auto r = b.getLocalBounds().toFloat().reduced (1);
-    juce::Colour c = bg;
-    if (b.getToggleState()) c = b.findColour (juce::Slider::rotarySliderFillColourId);
-    else if (down) c = c.brighter (0.15f);
-    else if (hov) c = c.brighter (0.07f);
-    g.setColour (c);
+    if (b.getToggleState()) {
+        g.setColour (b.findColour (juce::Slider::rotarySliderFillColourId));
+        g.fillRoundedRectangle (r, 5.f);
+        return;
+    }
+    g.setColour (down ? bg.brighter (0.12f) : bg);
     g.fillRoundedRectangle (r, 5.f);
-    g.setColour (juce::Colours::white.withAlpha (0.14f));
+    g.setColour (hov ? kLab : juce::Colour (0xff3a3d43));
     g.drawRoundedRectangle (r, 5.f, 1.f);
 }
 
@@ -248,6 +284,11 @@ SamplerEditor::FxChainView::FxChainView (SamplerEditor& e, bool g) : ed (e), isG
         knobs.push_back (std::make_unique<Knob> ("", kAccent));
         addAndMakeVisible (*knobs.back());
     }
+    addAndMakeVisible (picture);
+    picture.get = [this] (int k) { return selected >= 0 ? getParam (selected, k) : 0.f; };
+    picture.set = [this] (int k, float v) { if (selected >= 0) setParam (selected, k, v); };
+    picture.text = [this] (int k, float v) { return fxKnobText (picture.type, k, v); };
+    picture.onEdit = [this] { syncKnobs(); };
     refresh();
 }
 
@@ -319,7 +360,7 @@ void SamplerEditor::FxChainView::refresh() {
     for (auto& c : chips) removeChildComponent (c.get());
     chips.clear();
     auto act = activeSlotsInOrder (ch);
-    static const juce::uint32 kcols[8] = { 0xfff49ac1,0xfff87171,0xfffb923c,0xffa3e635,0xff22d3ee,0xffa78bfa,0xff34d399,0xff7dd3fc };
+    static const juce::uint32 kcols[8] = { 0xffe9a3b8,0xffe88a8a,0xfff2b48f,0xffa9d58e,0xff8fd0c2,0xffb9a7f0,0xff86c5c5,0xff8fc6e8 };
     for (size_t i = 0; i < act.size(); ++i) {
         int s = act[i];
         auto cp = std::make_unique<Chip> (*this, s);
@@ -335,6 +376,8 @@ void SamplerEditor::FxChainView::refresh() {
     int t = hasSel ? ch.slots[(size_t) selected].type.load() : 0;
     int nk = FxProcessor::numKnobs (t);
     typeBox.setVisible (hasSel); bypassB.setVisible (hasSel);
+    picture.setVisible (hasSel);
+    picture.type = hasSel ? t : -1;
     for (auto& k : knobs) k->setVisible (hasSel);
     emptyLab.setVisible (! hasSel);
     if (hasSel) {
@@ -343,6 +386,8 @@ void SamplerEditor::FxChainView::refresh() {
         bypassB.setToggleState (! sl.bypass.load(), juce::dontSendNotification);
         bypassB.setButtonText (sl.bypass.load() ? "OFF" : "ON");
         auto c = juce::Colour (kcols[t < 8 ? t : 0]);
+        picture.colour = c;
+        picture.repaint();
         for (int k = 0; k < nk; ++k) {
             knobs[(size_t) k]->setVisible (true);
             knobs[(size_t) k]->s.setColour (juce::Slider::rotarySliderFillColourId, c);
@@ -350,13 +395,23 @@ void SamplerEditor::FxChainView::refresh() {
             knobs[(size_t) k]->val.setColour (juce::Label::textColourId, c.brighter (0.2f));
             int slot = selected;
             knobs[(size_t) k]->setManual (getParam (slot, k),
-                [this, slot, k] (float nv) { setParam (slot, k, nv); },
+                [this, slot, k] (float nv) { setParam (slot, k, nv); picture.repaint(); },
                 [t, k] (float nv) { return fxKnobText (t, k, nv); });
         }
         for (int k = nk; k < (int) knobs.size(); ++k) knobs[(size_t) k]->setVisible (false);
     }
     resized();
     repaint();
+}
+
+void SamplerEditor::FxChainView::syncKnobs() {
+    if (selected < 0) return;
+    const int t = chain().slots[(size_t) selected].type.load();
+    for (int k = 0; k < FxProcessor::numKnobs (t) && k < (int) knobs.size(); ++k) {
+        const float v = getParam (selected, k);
+        knobs[(size_t) k]->s.setValue (v, juce::dontSendNotification);
+        knobs[(size_t) k]->val.setText (fxKnobText (t, k, v), juce::dontSendNotification);
+    }
 }
 
 void SamplerEditor::FxChainView::resized() {
@@ -380,12 +435,17 @@ void SamplerEditor::FxChainView::resized() {
     typeBox.setBounds (typeRow.removeFromLeft (170).reduced (2));
     bypassB.setBounds (typeRow.removeFromLeft (70).reduced (2));
     emptyLab.setBounds (dt);
-    int cols = 3, krows = 2;
-    int kcw = dt.getWidth() / cols, kh = dt.getHeight() / krows;
+    dt.removeFromTop (6);
+    picture.setBounds (dt.removeFromTop ((int) (dt.getHeight() * 0.58f)).reduced (2, 0));
+    dt.removeFromTop (8);
+    // the slot's knobs: one compact row under the picture
+    int vis = 0;
+    for (auto& k : knobs) if (k->isVisible()) ++vis;
+    const int kcw = dt.getWidth() / juce::jmax (1, vis);
     int vi = 0;
     for (auto& k : knobs) {
         if (! k->isVisible()) continue;
-        k->setBounds (dt.getX() + kcw * (vi % cols), dt.getY() + kh * (vi / cols), kcw, kh);
+        k->setBounds (dt.getX() + kcw * vi, dt.getY(), kcw, juce::jmin (dt.getHeight(), 112));
         ++vi;
     }
 }
@@ -445,7 +505,7 @@ static juce::Path overviewPath (const SampleData& d, juce::Rectangle<float> r, f
 static void drawHatch (juce::Graphics& g, juce::Rectangle<float> r) {
     g.saveState();
     g.reduceClipRegion (r.toNearestInt());
-    g.setColour (juce::Colour (0xff2a2a34));
+    g.setColour (kEdge);
     for (float x = r.getX() - r.getHeight(); x < r.getRight(); x += 7.f)
         g.drawLine (x, r.getBottom(), x + r.getHeight(), r.getY(), 2.f);
     g.restoreState();
@@ -453,7 +513,7 @@ static void drawHatch (juce::Graphics& g, juce::Rectangle<float> r) {
     juce::Path dashed;
     const float dash[] = { 3.f, 3.f };
     juce::PathStrokeType (1.f).createDashedStroke (dashed, border, dash, 2);
-    g.setColour (juce::Colour (0xff34343f));
+    g.setColour (juce::Colour (0xff3a3d43));
     g.fillPath (dashed);
 }
 
@@ -527,7 +587,7 @@ void PadView::paint (juce::Graphics& g) {
         n += has ? 1 : 0;
         auto dot = juce::Rectangle<float> (x + l * 11.f, dy, 7.f, 7.f);
         if (has) { g.setColour (col.withAlpha (0.9f)); g.fillEllipse (dot); }
-        else { g.setColour (pe.layers[l].missing ? kRed : juce::Colour (0xff3a3a46)); g.drawEllipse (dot, 1.f); }
+        else { g.setColour (pe.layers[l].missing ? kRed : juce::Colour (0xff3a3d43)); g.drawEllipse (dot, 1.f); }
     }
     if (n > 1) {
         g.setColour (col.withAlpha (0.85f));
@@ -542,7 +602,7 @@ void PadView::paint (juce::Graphics& g) {
     }
     // meter
     float my = dy + 12.f;
-    g.setColour (juce::Colour (0xff2a2a34));
+    g.setColour (kEdge);
     g.fillRoundedRectangle (x, my, w, 3.f, 1.5f);
     float m = juce::jlimit (0.f, 1.f, lastMeter);
     if (m > 0.002f) {
@@ -617,7 +677,7 @@ void LayerCell::paint (juce::Graphics& g) {
     auto col = padColour (p);
     bool selL = ed.selLayer() == li, has = L.hasSample();
     auto r = getLocalBounds().toFloat().reduced (1.f);
-    g.setColour (selL ? kPanelSel : juce::Colour (0xff18181e));
+    g.setColour (selL ? kPanelSel : juce::Colour (0xff16181c));
     g.fillRoundedRectangle (r, 4.f);
     g.setColour (dragOver ? kText : (selL ? col : kEdge));
     g.drawRoundedRectangle (r, 4.f, selL || dragOver ? 1.3f : 1.f);
@@ -684,9 +744,9 @@ void WaveView::paint (juce::Graphics& g) {
     auto& L = proc.pads[p].layers[li];
     auto col = padColour (p);
     auto r = getLocalBounds().toFloat();
-    g.setColour (juce::Colour (0xff16161c));
+    g.setColour (juce::Colour (0xff16181c));
     g.fillRoundedRectangle (r, 5.f);
-    g.setColour (dragOver ? kText : juce::Colour (0xff24242c));
+    g.setColour (dragOver ? kText : juce::Colour (0xff24272c));
     g.drawRoundedRectangle (r.reduced (0.5f), 5.f, dragOver ? 2.f : 1.f);
     g.setFont (juce::Font (9.f, juce::Font::bold));
     g.setColour (col);
@@ -702,7 +762,7 @@ void WaveView::paint (juce::Graphics& g) {
         g.setFont (juce::Font (9.f));
         g.drawText (info, 64, 5, 240, 14, juce::Justification::centredLeft);
 
-        g.setColour (juce::Colour (0xff2a2a34));
+        g.setColour (kEdge);
         g.drawHorizontalLine ((int) pa.getCentreY(), pa.getX(), pa.getRight());
         g.setColour (col.withAlpha (0.8f));
         g.fillPath (overviewPath (*d, pa));
@@ -797,7 +857,7 @@ void SampleListModel::paintListBoxItem (int row, juce::Graphics& g, int w, int h
         g.fillRoundedRectangle (2.f, 1.f, (float) w - 4.f, (float) h - 2.f, 4.f);
     }
     auto badge = juce::Rectangle<float> (6.f, h * 0.5f - 8.f, 38.f, 16.f);
-    g.setColour (e.isDir ? juce::Colour (0xff3a3a48) : accent.withAlpha (0.85f));
+    g.setColour (e.isDir ? juce::Colour (0xff3a3d43) : accent.withAlpha (0.85f));
     g.fillRoundedRectangle (badge, 4.f);
     g.setColour (e.isDir ? kText : kBg);
     g.setFont (juce::Font (9.5f, juce::Font::bold));
@@ -957,7 +1017,7 @@ MacroPanel::MacroPanel (SamplerEditor& e) : ed (e) {
         nl.setEditable (false, true, false);
         nl.setFont (juce::Font (11.f, juce::Font::bold));
         nl.setColour (juce::Label::textColourId, kText);
-        nl.setColour (juce::Label::backgroundColourId, juce::Colour (0xff1c1c22));
+        nl.setColour (juce::Label::backgroundColourId, kRaised);
         nl.setColour (juce::Label::outlineColourId, kEdge);
         nl.setTooltip ("Double-click to rename");
         nl.onTextChange = [this, k] {
@@ -1004,7 +1064,7 @@ void MacroPanel::paint (juce::Graphics& g) {
     float uw = (getWidth() - 24.f) / NumMacros;
     for (int k = 0; k < NumMacros; ++k) {
         float ux = 12.f + uw * k;
-        if (k > 0) { g.setColour (juce::Colour (0xff26262f)); g.drawVerticalLine ((int) ux, 34.f, (float) getHeight() - 10.f); }
+        if (k > 0) { g.setColour (juce::Colour (0xff2a2d33)); g.drawVerticalLine ((int) ux, 34.f, (float) getHeight() - 10.f); }
         float v = (float) knobs[k]->s.getValue();
         int pc = juce::roundToInt ((v - 0.5f) * 200.f);
         auto nb = names[k].getBounds();
@@ -1018,7 +1078,7 @@ void MacroPanel::paint (juce::Graphics& g) {
         g.setFont (juce::Font (9.f, juce::Font::bold));
         g.drawText (juce::String (labels.size()) + (labels.size() == 1 ? " TARGET" : " TARGETS"), nb.getX(), nb.getBottom() + 19, nb.getWidth(), 12, juce::Justification::centredLeft);
         auto tr = targetRects[k];
-        g.setColour (juce::Colour (0xff1c1c22));
+        g.setColour (kRaised);
         g.fillRoundedRectangle (tr.toFloat(), 3.f);
         g.setColour (labels.isEmpty() ? kDim : kLab);
         g.setFont (juce::Font (9.f));
@@ -1120,7 +1180,7 @@ SamplerEditor::SamplerEditor (SamplerProcessor& p) : juce::AudioProcessorEditor 
     randPartB.setTooltip ("Randomize timbre only: tune, pitch env, filter, drive, tone, sends, effect colour.\n"
                           "Never level, pan, envelopes, compression, punch or velocity response.");
     mutPartB.setTooltip ("Nudge the same timbre settings a little");
-    mutPartB.setColour (juce::Slider::rotarySliderFillColourId, juce::Colour (0xffa78bfa));
+    mutPartB.setColour (juce::Slider::rotarySliderFillColourId, juce::Colour (0xffb9a7f0));
     masterDial.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
     masterDial.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
     masterDial.setColour (juce::Slider::rotarySliderFillColourId, kAmber);
@@ -1131,7 +1191,7 @@ SamplerEditor::SamplerEditor (SamplerProcessor& p) : juce::AudioProcessorEditor 
     limitB.setToggleState (proc.limiterOn.load(), juce::dontSendNotification);
     limitB.onClick = [this] { proc.limiterOn = limitB.getToggleState(); };
     kitLab.setFont (juce::Font (12.f, juce::Font::bold));
-    kitLab.setColour (juce::Label::textColourId, juce::Colour (0xff8a8a98));
+    kitLab.setColour (juce::Label::textColourId, juce::Colour (0xff8f8b85));
     voiceLab.setFont (juce::Font (9.5f, juce::Font::bold));
     voiceLab.setColour (juce::Label::textColourId, kDim);
     voiceLab.setJustificationType (juce::Justification::centredRight);
@@ -1159,7 +1219,7 @@ SamplerEditor::SamplerEditor (SamplerProcessor& p) : juce::AudioProcessorEditor 
 
     nameLab.setEditable (false, true, false);
     nameLab.setFont (juce::Font (13.f));
-    nameLab.setColour (juce::Label::backgroundColourId, juce::Colour (0xff1c1c22));
+    nameLab.setColour (juce::Label::backgroundColourId, kRaised);
     nameLab.setColour (juce::Label::outlineColourId, kEdge);
     nameLab.setColour (juce::Label::textColourId, kText);
     nameLab.setTooltip ("Double-click to rename the pad (empty = file name)");
@@ -1261,9 +1321,11 @@ SamplerEditor::SamplerEditor (SamplerProcessor& p) : juce::AudioProcessorEditor 
 
     // footer
     addAndMakeVisible (outTitle); addAndMakeVisible (masterFader); addAndMakeVisible (limitB); addAndMakeVisible (outMeter);
+    outTitle.setFont (juce::Font (9.5f, juce::Font::bold));
+    outTitle.setColour (juce::Label::textColourId, kLab);
     masterFader.setColour (juce::Slider::thumbColourId, kAccent);
     masterFader.setColour (juce::Slider::trackColourId, kAccent.withAlpha (0.5f));
-    masterFader.setColour (juce::Slider::backgroundColourId, juce::Colour (0xff2a2a34));
+    masterFader.setColour (juce::Slider::backgroundColourId, kEdge);
     masterFaderAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "master", masterFader);
 
     browser = std::make_unique<PresetBrowser> (proc, lnf);
@@ -1606,7 +1668,24 @@ void SamplerEditor::stepLayerFile (int dir) {
 // ---------------- layout ----------------
 void SamplerEditor::paint (juce::Graphics& g) {
     g.fillAll (kBg);
-    if (footerRect.getWidth() > 0) { g.setColour (juce::Colour (0xff141419)); g.fillRect (footerRect); }
+    // header: the Pastel family mark + name
+    const juce::uint32 cols[4] = { 0xffe88a8a, 0xff8fd0c2, 0xffe9a3b8, 0xffa9d58e };
+    for (int i = 0; i < 4; ++i) {
+        g.setColour (juce::Colour (cols[i]));
+        g.fillRoundedRectangle (16.f + (float) (i % 2) * 10.f, 16.f + (float) (i / 2) * 10.f, 8.f, 8.f, 2.f);
+    }
+    g.setColour (kText);
+    g.setFont (lnf.latoBlack != nullptr ? juce::Font (juce::FontOptions (lnf.latoBlack)).withHeight (15.f) : juce::Font (15.f, juce::Font::bold));
+    if (getWidth() >= 1240) g.drawText ("PASTEL DRUM SAMPLER", 42, 12, 180, 28, juce::Justification::centredLeft);
+    g.setColour (kEdge);
+    g.fillRect (8, 51, getWidth() - 16, 1);
+    if (footerRect.getWidth() > 0) {
+        auto fr = footerRect.reduced (8, 6).toFloat();
+        g.setColour (kPanel);
+        g.fillRoundedRectangle (fr, 8.f);
+        g.setColour (kEdge);
+        g.drawRoundedRectangle (fr.reduced (0.5f), 8.f, 1.f);
+    }
     g.setColour (padColour (sel()));
     g.setFont (juce::Font (18.f, juce::Font::bold));
     g.drawText (juce::String (sel() + 1), padNumRect, juce::Justification::centredLeft);
@@ -1615,7 +1694,8 @@ void SamplerEditor::paint (juce::Graphics& g) {
 void SamplerEditor::resized() {
     if (getWidth() < 50 || getHeight() < 50 || padViews.size() < (size_t) NumPads || ! macroPanel) return;
     auto r = getLocalBounds();
-    auto header = r.removeFromTop (52);
+    auto header = r.removeFromTop (52).reduced (0, 8);
+    header.removeFromLeft (getWidth() < 1240 ? 44 : 218); // logo (+ name when there is room), painted
     prevB.setBounds (header.removeFromLeft (30).reduced (2));
     presetBtn.setBounds (header.removeFromLeft (230).reduced (2));
     nextB.setBounds (header.removeFromLeft (30).reduced (2));
@@ -1632,11 +1712,11 @@ void SamplerEditor::resized() {
     masterDial.setBounds (mhead.removeFromLeft (46).reduced (2));
     voiceLab.setBounds (header.removeFromRight (110).reduced (4));
     kitLab.setBounds (header.reduced (4));
-    kitLab.setVisible (getWidth() >= 1180);
+    kitLab.setVisible (getWidth() >= 1400);   // the preset button already names the kit
 
     footerRect = r.removeFromBottom (64);
     auto orr = footerRect.reduced (8);
-    outTitle.setBounds (orr.removeFromLeft (80).reduced (2));
+    outTitle.setBounds (orr.removeFromLeft (80).reduced (2).translated (8, 0));
     limitB.setBounds (orr.removeFromRight (90).reduced (14, 8));
     outMeter.setBounds (orr.removeFromRight (180).reduced (4, 12));
     masterFader.setBounds (orr.reduced (2));

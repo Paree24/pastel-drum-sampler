@@ -34,6 +34,10 @@ juce_add_plugin(PastelDrumSampler
 
 juce_generate_juce_header(PastelDrumSampler)
 
+# embedded Lato (SIL OFL 1.1, see Assets/OFL-NOTICE.txt): the v3 UI type
+juce_add_binary_data(SamplerAssets HEADER_NAME SamplerAssets.h NAMESPACE SamplerAssets
+    SOURCES Assets/Lato-Regular.ttf Assets/Lato-Bold.ttf Assets/Lato-Black.ttf)
+
 set(SAMPLER_CORE_SOURCES
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
@@ -56,6 +60,7 @@ target_sources(PastelDrumSampler PRIVATE ${SAMPLER_CORE_SOURCES})
 target_include_directories(PastelDrumSampler PRIVATE Source Source/dsp)
 target_compile_definitions(PastelDrumSampler PRIVATE ${SAMPLER_DEFS})
 target_link_libraries(PastelDrumSampler PRIVATE
+    SamplerAssets
     juce::juce_audio_utils
     juce::juce_dsp
     juce::juce_recommended_config_flags
@@ -72,7 +77,7 @@ foreach(tool E2ETest UiShot FactoryBuild)
     add_executable(${tool} ${TOOL_${tool}} ${SAMPLER_CORE_SOURCES})
     target_include_directories(${tool} PRIVATE Source Source/dsp
         ${CMAKE_CURRENT_BINARY_DIR}/PastelDrumSampler_artefacts/JuceLibraryCode)
-    target_link_libraries(${tool} PRIVATE juce::juce_audio_utils juce::juce_audio_processors juce::juce_audio_formats
+    target_link_libraries(${tool} PRIVATE SamplerAssets juce::juce_audio_utils juce::juce_audio_processors juce::juce_audio_formats
         juce::juce_gui_basics juce::juce_dsp juce::juce_audio_basics juce::juce_graphics
         juce::juce_data_structures juce::juce_events juce::juce_core
         juce::juce_recommended_config_flags)

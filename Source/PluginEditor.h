@@ -3,21 +3,29 @@
 #include "PluginProcessor.h"
 #include "FileLibrary.h"
 #include "Visuals.h"
+#include "FxPicture.h"
 
 namespace mds {
 
 class PresetBrowser;
 class SamplerEditor;
 
+// v3 design (after Pastel EFX Grid; see mockup/redesign_v3.png): charcoal
+// panels with thin edges, the selected pad's pastel as the one accent, arc
+// knobs, embedded Lato.
 struct PastelLNF : juce::LookAndFeel_V4 {
     PastelLNF();
+    juce::Typeface::Ptr getTypefaceForFont (const juce::Font&) override;
+    juce::Font getTextButtonFont (juce::TextButton&, int) override;
+    void drawPopupMenuBackground (juce::Graphics&, int w, int h) override;
+    juce::Typeface::Ptr latoReg, latoBold, latoBlack;
     void drawRotarySlider (juce::Graphics&, int x, int y, int w, int h, float pos,
                            float start, float end, juce::Slider&) override;
     void drawLinearSlider (juce::Graphics&, int x, int y, int w, int h, float pos,
                            float min, float max, juce::Slider::SliderStyle, juce::Slider&) override;
     void drawComboBox (juce::Graphics&, int w, int h, bool down, int bx, int by, int bw, int bh, juce::ComboBox&) override;
     void drawButtonBackground (juce::Graphics&, juce::Button&, const juce::Colour&, bool, bool) override;
-    juce::Colour accent = juce::Colour (0xfff49ac1);
+    juce::Colour accent = juce::Colour (0xffe9a3b8);
 };
 
 // slider that hands right-clicks to a callback (lock / macro menu) instead of dragging
@@ -178,6 +186,8 @@ public:
         juce::Label emptyLab { {}, "EMPTY - click + ADD to insert an effect" };
         std::vector<std::unique_ptr<Knob>> knobs;
         std::vector<std::unique_ptr<Chip>> chips;
+        FxPicture picture;    // v3: the selected effect, drawn and dragged (the knobs stay in sync)
+        void syncKnobs();
     };
 
     SamplerEditor (SamplerProcessor&);
