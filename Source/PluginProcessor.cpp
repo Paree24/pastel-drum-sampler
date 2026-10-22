@@ -166,8 +166,11 @@ void SamplerProcessor::startVoice (int p, int li, float vel) {
     const float* e = pe.eff;
     VoiceStart s;
     s.data = d; s.pad = p; s.layer = li; s.hostRate = sampleRate;
-    float velAmt = e[PP_VelAmp] * 0.01f;
-    float velGain = 1.f - velAmt * (1.f - std::pow (juce::jlimit (0.f, 1.f, vel), 1.6f));
+    // power curve: half velocity ~-8 dB and ghost notes -30 dB or lower at the
+    // default 70% (the old blend floored at 1 - VEL>AMP: only ~10 dB of range);
+    // VEL>AMP 0 = no velocity response (same curve as Pastel Drum Synth)
+    float velAmt = juce::jlimit (0.f, 1.f, e[PP_VelAmp] * 0.01f);
+    float velGain = std::pow (juce::jlimit (0.05f, 1.f, vel), 2.f * velAmt);
     float lvDb = L.v[LP_Level].load();
     float lvl = lvDb <= -59.5f ? 0.f : juce::Decibels::decibelsToGain (lvDb);
     if (L.normalize.load() && d->peak > 1.0e-4f) lvl *= 0.977f / d->peak;

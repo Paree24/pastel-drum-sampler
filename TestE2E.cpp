@@ -243,6 +243,16 @@ int main() {
         auto full = render (p, 15000, hit (36, 0, 1.f));
         auto soft = render (p, 15000, hit (36, 0, 0.3f));
         CHECK (peak (soft, 0) < peak (full, 0) * 0.6f, "VEL>AMP: soft hits are quieter (%.2f vs %.2f)", peak (soft, 0), peak (full, 0));
+        {
+            // a real dynamic range at the default 70%: half ~-8 dB, ghost notes far down
+            auto db = [&] (float v) { return 20.f * std::log10 (std::max (1.0e-9f, peak (render (p, 15000, hit (36, 0, v)), 0)) / peak (full, 0)); };
+            const float half = db (0.5f), ghost = db (0.1f);
+            CHECK (half < -6.f && half > -12.f && ghost < -24.f, "VEL>AMP curve: half %.1f dB, vel 0.1 %.1f dB", half, ghost);
+            p.setPadParam (0, PP_VelAmp, 0.f); p.pullParamsForTest();
+            const float flat = db (0.1f);
+            CHECK (std::abs (flat) < 0.1f, "VEL>AMP 0: velocity leaves the level alone (%.2f dB)", flat);
+            p.setPadParam (0, PP_VelAmp, 70.f); p.pullParamsForTest();
+        }
         p.setPadParam (0, PP_Level, -60.f); p.pullParamsForTest();
         CHECK (peak (render (p, 15000, hit (36)), 0) < 1.0e-6f, "pad LEVEL -inf is silent");
         p.setPadParam (0, PP_Level, 0.f);
