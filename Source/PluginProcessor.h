@@ -6,6 +6,7 @@
 #include "dsp/TempoSync.h"
 #include "Presets.h"
 #include "Visuals.h"
+#include "MidiLearn.h"
 
 namespace mds {
 
@@ -79,6 +80,7 @@ public:
     std::atomic<int> activeVoices { 0 };
 
     juce::AudioProcessorValueTreeState apvts;
+    pastel::MidiLearn midiLearn { *this, "Pastel Drum Sampler" }; // global CC map + preset knob
     std::atomic<int> stateVersion { 0 }; // bumped on every structural change; UI refreshes on change
     double currentSampleRate() const { return sampleRate; }
 

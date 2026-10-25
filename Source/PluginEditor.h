@@ -223,6 +223,7 @@ private:
     juce::TextButton presetBtn { "Init" };
     juce::TextButton prevB { "<" }, nextB { ">" }, randPartB { "RANDOMIZE" }, mutPartB { "MUTATE" },
                      randKitB { "KIT RND" }, undoB { "UNDO" }, redoB { "REDO" }, initB { "INIT" };
+    pastel::MidiLearnButton midiB;
     std::unique_ptr<PresetBrowser> browser;
     juce::ComboBox scopeBox; // PAD / KIT for rand/mut
     juce::Slider masterDial; juce::Label masterLab, kitLab, voiceLab;

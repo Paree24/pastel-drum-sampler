@@ -47,6 +47,7 @@ set(SAMPLER_CORE_SOURCES
     Source/Presets.cpp
     Source/PresetFiles.cpp
     Source/FileLibrary.cpp
+    Source/MidiLearn.cpp
 )
 set(SAMPLER_DEFS
     JUCE_WEB_BROWSER=0

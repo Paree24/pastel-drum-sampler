@@ -98,6 +98,7 @@ int main() {
     tmpRoot.createDirectory();
     setUserPresetDirForTest (tmpRoot.getChildFile ("UserKits"));
     FileLibrary::setSettingsFolderForTest (juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("PastelSamplerE2ESettings").getFullPathName()); // never touch the user's shortcuts
+    pastel::MidiLearn::setDirectoryForTest (tmpRoot.getChildFile ("MidiLearn")); // never the user's ~/.config
     setFactoryDirsForTest (tmpRoot.getChildFile ("NoFactory"), tmpRoot.getChildFile ("NoFactoryOverride"));
     rescanFactoryPresets();
 
@@ -620,6 +621,85 @@ int main() {
         for (auto& fk : getFactoryPresets())
             if (fk.file.loadFileAsString().contains ("/home/")) noAbs = false;
         CHECK (noAbs, "factory kit files hold no build-machine paths");
+        // ---- global MIDI learn: CC map + preset knob shared by every instance ----
+        {
+            using Enc = pastel::MidiLearn::Enc;
+            auto det = [] (std::vector<int> v) { return pastel::MidiLearn::detectEncoding (v); };
+            CHECK (det ({ 65, 65, 65, 65 }) == Enc::offset64 && det ({ 63, 62, 63 }) == Enc::offset64, "midi learn: Arturia-style 64+n encoder detected");
+            CHECK (det ({ 1, 1, 2, 1 }) == Enc::twos && det ({ 127, 127, 126 }) == Enc::twos, "midi learn: two's complement encoder detected");
+            CHECK (det ({ 60, 61, 62, 63 }) == Enc::absolute && det ({ 0, 1, 2, 3 }) == Enc::absolute
+                   && det ({ 127, 126, 125, 124 }) == Enc::absolute, "midi learn: turned absolute knob stays absolute");
+
+            auto cc = [] (int num, int val) { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::controllerEvent (1, num, val), 0); return m; };
+            auto a = makeProc();
+            auto& ml = a->midiLearn;
+            ml.clearAll();
+            auto* mst = a->apvts.getParameter ("master");
+            mst->setValueNotifyingHost (0.5f);
+            ml.setLearning (true);
+            mst->beginChangeGesture(); mst->endChangeGesture(); // touching the control on screen arms it
+            CHECK (ml.getArmedName() == mst->getName (40), "midi learn: touching a control arms it");
+            const float before = mst->getValue();
+            for (int i = 0; i < 4; ++i) ml.process (cc (74, 65));
+            CHECK (std::abs (mst->getValue() - before) < 1e-6f, "midi learn: learning CCs never move the armed control");
+            ml.tick();
+            auto maps = ml.getMappings();
+            CHECK (maps.size() == 1 && maps[0].cc == 74 && maps[0].paramId == "master" && maps[0].enc == Enc::offset64,
+                   "midi learn: CC 74 learned as a relative knob");
+            ml.setLearning (false);
+            ml.process (cc (74, 66));
+            const float up = mst->getValue();
+            ml.process (cc (74, 62));
+            CHECK (up > before && mst->getValue() < up, "midi learn: endless knob turns the right way both directions");
+
+            auto b = makeProc();
+            auto* mstB = b->apvts.getParameter ("master");
+            mstB->setValueNotifyingHost (0.5f);
+            const float bBefore = mstB->getValue();
+            b->midiLearn.process (cc (74, 70));
+            CHECK (b->midiLearn.getMappings().size() == 1 && mstB->getValue() > bBefore, "midi learn: mapping is global, a new instance has it");
+
+            ml.setLearning (true);
+            mst->beginChangeGesture(); mst->endChangeGesture();
+            for (int v : { 10, 11, 12, 13 }) ml.process (cc (21, v));
+            ml.tick();
+            maps = ml.getMappings();
+            CHECK (maps.size() == 1 && maps[0].cc == 21 && maps[0].enc == Enc::absolute, "midi learn: re-learning moves the control to the new knob");
+            ml.setLearning (false);
+            ml.process (cc (21, 127));
+            CHECK (std::abs (mst->getValue() - 1.0f) < 1e-6f, "midi learn: absolute knob sets the value directly");
+
+            int stepped = 0;
+            auto keep = ml.onPresetStep;
+            ml.onPresetStep = [&] (int d) { stepped += d; };
+            ml.armPresetKnob();
+            ml.process (cc (114, 1));
+            for (int i = 0; i < 10; ++i) ml.tick();
+            CHECK (ml.getPresetKnobCC() == 114, "midi learn: preset knob learned from one nudge");
+            ml.process (cc (114, 1)); ml.process (cc (114, 3));
+            ml.tick();
+            ml.process (cc (114, 127));
+            ml.tick();
+            CHECK (stepped == 1, "midi learn: preset knob two steps forward, one back");
+            ml.onPresetStep = keep;
+
+            // a new instance: two quick detents while the first kit is still loading land two kits on
+            auto c = makeProc();
+            auto& all = getFactoryPresets();
+            int pos = 0;
+            for (size_t i = 0; i < all.size(); ++i)
+                if (all[i].index == c->currentKit) { pos = (int) i; break; }
+            const int expect = all[(size_t) ((pos + 2) % (int) all.size())].index;
+            c->midiLearn.process (cc (114, 1));
+            c->midiLearn.tick();
+            c->midiLearn.process (cc (114, 1));
+            c->midiLearn.tick();
+            for (int t = 0; t < 500 && c->isLoadingKit(); ++t) flush();
+            CHECK (! c->isLoadingKit() && c->getCurrentProgram() == expect, "midi learn: preset knob steps kits in a new instance (%d, want %d)",
+                   c->getCurrentProgram(), expect);
+            ml.clearAll();
+            CHECK (ml.getMappings().empty() && ml.getPresetKnobCC() < 0, "midi learn: clear all");
+        }
         setFactoryDirsForTest (tmpRoot.getChildFile ("NoFactory"), tmpRoot.getChildFile ("NoFactoryOverride"));
         rescanFactoryPresets();
     }

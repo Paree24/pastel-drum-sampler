@@ -1144,8 +1144,10 @@ void MacroPanel::showTargetMenu (int k) {
 }
 
 // ================= Editor =================
-SamplerEditor::SamplerEditor (SamplerProcessor& p) : juce::AudioProcessorEditor (p), proc (p) {
+SamplerEditor::SamplerEditor (SamplerProcessor& p) : juce::AudioProcessorEditor (p), proc (p), midiB (p.midiLearn) {
     setLookAndFeel (&lnf);
+    midiB.setColour (juce::TextButton::buttonOnColourId, kAccent);
+    midiB.setColour (juce::Slider::rotarySliderFillColourId, kAccent); // PastelLNF fills toggled buttons with this
 
     // header
     presetBtn.onClick = [this] { rescanFactoryPresets(); browser->setVisible (true); };
@@ -1195,7 +1197,7 @@ SamplerEditor::SamplerEditor (SamplerProcessor& p) : juce::AudioProcessorEditor 
     voiceLab.setFont (juce::Font (9.5f, juce::Font::bold));
     voiceLab.setColour (juce::Label::textColourId, kDim);
     voiceLab.setJustificationType (juce::Justification::centredRight);
-    for (auto* c : std::initializer_list<juce::Component*> { &presetBtn, &prevB, &nextB, &scopeBox, &randPartB, &mutPartB, &randKitB,
+    for (auto* c : std::initializer_list<juce::Component*> { &presetBtn, &prevB, &nextB, &midiB, &scopeBox, &randPartB, &mutPartB, &randKitB,
                                                              &undoB, &redoB, &initB, &masterDial, &masterLab, &kitLab, &voiceLab })
         addAndMakeVisible (*c);
 
@@ -1697,15 +1699,17 @@ void SamplerEditor::resized() {
     auto header = r.removeFromTop (52).reduced (0, 8);
     header.removeFromLeft (getWidth() < 1240 ? 44 : 218); // logo (+ name when there is room), painted
     prevB.setBounds (header.removeFromLeft (30).reduced (2));
-    presetBtn.setBounds (header.removeFromLeft (230).reduced (2));
+    presetBtn.setBounds (header.removeFromLeft (220).reduced (2));
     nextB.setBounds (header.removeFromLeft (30).reduced (2));
     header.removeFromLeft (8);
-    undoB.setBounds (header.removeFromLeft (62).reduced (2));
-    redoB.setBounds (header.removeFromLeft (62).reduced (2));
+    midiB.setBounds (header.removeFromLeft (64).reduced (2));
+    header.removeFromLeft (8);
+    undoB.setBounds (header.removeFromLeft (52).reduced (2));
+    redoB.setBounds (header.removeFromLeft (52).reduced (2));
     initB.setBounds (header.removeFromLeft (54).reduced (2));
     scopeBox.setBounds (header.removeFromLeft (80).reduced (2));
-    randPartB.setBounds (header.removeFromLeft (110).reduced (2));
-    mutPartB.setBounds (header.removeFromLeft (100).reduced (2));
+    randPartB.setBounds (header.removeFromLeft (94).reduced (2));
+    mutPartB.setBounds (header.removeFromLeft (74).reduced (2));
     randKitB.setBounds (header.removeFromLeft (70).reduced (2));
     auto mhead = header.removeFromRight (120);
     masterLab.setBounds (mhead.removeFromLeft (60).reduced (2));

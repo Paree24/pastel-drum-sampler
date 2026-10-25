@@ -22,6 +22,20 @@ SamplerProcessor::SamplerProcessor()
     auto& fac = getFactoryPresets();
     if (! fac.empty()) applyPreset (*this, fac.front().index);
     undoStack.clear();
+    midiLearn.onPresetStep = [this, requested = -1] (int delta) mutable {
+        // same walk as the header's < > buttons: factory order, wrapping.
+        // currentKit changes only when a load lands: while one is running,
+        // keep walking from the kit the knob asked for last
+        auto& all = getFactoryPresets();
+        if (all.empty()) return;
+        const int from = isLoadingKit() && requested >= 0 ? requested : currentKit;
+        int pos = 0;
+        for (size_t i = 0; i < all.size(); ++i)
+            if (all[i].index == from) { pos = (int) i; break; }
+        const int n = (int) all.size();
+        requested = all[(size_t) (((pos + delta) % n + n) % n)].index;
+        loadKitAsync (requested);
+    };
     gestureUndo.startValue.assign ((size_t) getParameters().size(), -1.f);
     addListener (&gestureUndo);
     startTimerHz (10);
@@ -222,6 +236,7 @@ void SamplerProcessor::releasePad (int p) {
 
 void SamplerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi) {
     juce::ScopedNoDenormals noDenormals;
+    midiLearn.process (midi); // learned CCs land before this block renders
     pullParams();
     const int N = buffer.getNumSamples();
     for (int ch = 0; ch < buffer.getNumChannels(); ++ch) buffer.clear (ch, 0, N);
